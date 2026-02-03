@@ -1,0 +1,40 @@
+# Z-Image World Model Requirements
+# Core ML frameworks
+torch>=2.6.0
+torchvision>=0.21.0
+accelerate>=1.0.0
+transformers>=4.45.0
+
+# Diffusion models
+diffusers @ git+https://github.com/huggingface/diffusers.git
+safetensors>=0.4.0
+
+# StreamDiffusion dependencies
+xformers>=0.0.28
+triton>=2.3.0
+
+# LoRA training
+peft>=0.13.0
+
+# Video processing
+opencv-python>=4.10.0
+imageio>=2.36.0
+imageio-ffmpeg>=0.5.0
+
+# Utilities
+numpy>=1.26.0
+einops>=0.8.0
+omegaconf>=2.3.0
+pyyaml>=6.0
+
+# Interactive demo
+pygame>=2.6.0
+gradio>=5.0.0
+
+# Monitoring and logging
+wandb>=0.18.0
+tqdm>=4.66.0
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.24.0

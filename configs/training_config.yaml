@@ -1,0 +1,103 @@
+# Z-Image World Model Training Configuration
+
+# Stage 1: Causal Adaptation (No Actions)
+stage1:
+  name: "causal_adaptation"
+
+  # Data
+  data:
+    dataset_type: "video"
+    data_path: "data/videos"
+    num_frames: 8
+    frame_skip: 1
+    resolution: [480, 640]
+
+  # Training
+  training:
+    batch_size: 4
+    gradient_accumulation_steps: 4
+    learning_rate: 1.0e-5
+    weight_decay: 0.01
+    warmup_steps: 1000
+    max_steps: 100000
+
+    # Optimizer
+    optimizer: "adamw"
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+
+    # Precision
+    mixed_precision: "bf16"
+    gradient_checkpointing: true
+
+  # Diffusion Forcing
+  diffusion_forcing:
+    independent_noise: true
+    noise_schedule: "scaled_linear"
+    prediction_type: "v_prediction"
+
+  # Checkpointing
+  checkpointing:
+    save_steps: 5000
+    output_dir: "checkpoints/stage1"
+
+  # Logging
+  logging:
+    log_steps: 100
+    wandb_project: "z-image-world"
+    wandb_run_name: "stage1_causal"
+
+# Stage 2: Action Conditioning with LoRA
+stage2:
+  name: "action_conditioning"
+
+  # Data
+  data:
+    dataset_type: "action_video"
+    data_path: "data/action_videos"
+    num_frames: 8
+    frame_skip: 1
+    resolution: [480, 640]
+
+  # Training
+  training:
+    batch_size: 8
+    gradient_accumulation_steps: 2
+    learning_rate: 5.0e-5
+    weight_decay: 0.01
+    warmup_steps: 500
+    max_steps: 50000
+
+    # Optimizer
+    optimizer: "adamw"
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+
+    # Precision
+    mixed_precision: "bf16"
+    gradient_checkpointing: true
+
+  # LoRA Configuration
+  lora:
+    enabled: true
+    rank: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      - "to_q"
+      - "to_k"
+      - "to_v"
+      - "to_out.0"
+
+  # Checkpointing
+  checkpointing:
+    save_steps: 2000
+    output_dir: "checkpoints/stage2"
+    resume_from: "checkpoints/stage1/final"
+
+  # Logging
+  logging:
+    log_steps: 50
+    wandb_project: "z-image-world"
+    wandb_run_name: "stage2_action"

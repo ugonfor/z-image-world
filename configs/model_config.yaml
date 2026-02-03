@@ -1,0 +1,56 @@
+# Z-Image World Model Configuration
+
+model:
+  # Base model settings
+  name: "THUDM/Z-Image-Omni-Base"
+  vae_path: null  # Uses model default
+  dtype: "bfloat16"
+
+  # DiT architecture
+  dit:
+    hidden_size: 4096
+    num_heads: 32
+    num_layers: 28
+    patch_size: 2
+    in_channels: 16  # VAE latent channels
+
+  # Causal attention settings
+  causal:
+    enabled: true
+    num_sink_tokens: 4
+    max_context_frames: 16
+
+  # Action conditioning
+  action:
+    num_actions: 17
+    embedding_dim: 512
+    injection_layers: [7, 14, 21]  # Inject at 1/4, 1/2, 3/4 depth
+
+streaming:
+  # KV cache settings
+  kv_cache:
+    enabled: true
+    max_length: 4096
+    sink_tokens: 4
+
+  # Denoising settings
+  num_inference_steps: 4  # Reduced for real-time
+  guidance_scale: 2.0
+
+  # VAE streaming
+  vae:
+    tiled_decode: true
+    tile_size: 512
+
+inference:
+  # Resolution
+  height: 480
+  width: 640
+
+  # Performance
+  use_flash_attention: true
+  compile_model: true
+  channels_last: true
+
+  # Batching
+  frame_buffer_size: 4

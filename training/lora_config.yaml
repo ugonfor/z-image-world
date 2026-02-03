@@ -1,0 +1,114 @@
+# LoRA Configuration for Z-Image World Action Fine-tuning
+
+# Base LoRA settings
+lora:
+  # Rank of the low-rank matrices (higher = more capacity but more params)
+  rank: 16
+
+  # Scaling factor (effective learning rate = alpha / rank)
+  alpha: 32
+
+  # Dropout for regularization
+  dropout: 0.05
+
+  # Modules to apply LoRA to
+  # These are the attention projection layers in the DiT
+  target_modules:
+    - "to_q"      # Query projection
+    - "to_k"      # Key projection
+    - "to_v"      # Value projection
+    - "to_out.0"  # Output projection
+
+  # Whether to train bias terms
+  bias: "none"  # "none", "all", or "lora_only"
+
+  # Initialization
+  init_lora_weights: true
+
+# Training-specific settings
+training:
+  # Only train LoRA weights + action encoder (freeze base model)
+  freeze_base_model: true
+
+  # Gradient checkpointing for memory efficiency
+  gradient_checkpointing: true
+
+  # Mixed precision training
+  mixed_precision: "bf16"
+
+  # Effective batch size = batch_size * gradient_accumulation_steps
+  batch_size: 8
+  gradient_accumulation_steps: 2
+
+  # Learning rate (LoRA typically needs higher LR)
+  learning_rate: 5.0e-5
+
+  # Warmup steps
+  warmup_steps: 500
+
+  # Total training steps
+  max_steps: 50000
+
+  # Weight decay
+  weight_decay: 0.01
+
+  # Gradient clipping
+  max_grad_norm: 1.0
+
+# Curriculum learning for action conditioning
+curriculum:
+  enabled: true
+
+  stages:
+    # Stage 1: Focus on basic movement actions
+    - name: "movement_only"
+      steps: 10000
+      action_weight: 0.5
+      action_filter:
+        - 0  # forward
+        - 1  # backward
+        - 2  # left
+        - 3  # right
+        - 8  # idle
+
+    # Stage 2: Add camera controls
+    - name: "movement_camera"
+      steps: 25000
+      action_weight: 0.75
+      action_filter:
+        - 0  # forward
+        - 1  # backward
+        - 2  # left
+        - 3  # right
+        - 4  # forward_left
+        - 5  # forward_right
+        - 6  # backward_left
+        - 7  # backward_right
+        - 8  # idle
+        - 9  # look_up
+        - 10 # look_down
+        - 11 # look_left
+        - 12 # look_right
+
+    # Stage 3: Full action space
+    - name: "full_actions"
+      steps: 50000
+      action_weight: 1.0
+      action_filter: null  # All actions
+
+# Checkpointing
+checkpointing:
+  save_steps: 2000
+  output_dir: "checkpoints/lora"
+  keep_last_n: 5
+
+# Logging
+logging:
+  log_steps: 50
+  wandb:
+    project: "z-image-world"
+    run_name: "lora_action_finetune"
+    tags:
+      - "lora"
+      - "action-conditioning"
+      - "stage2"
