@@ -216,8 +216,12 @@ class InteractiveApp:
 
         self.pipeline.set_initial_frame(image)
 
-    def run(self):
-        """Run the interactive demo loop."""
+    def run(self, initial_image: np.ndarray | torch.Tensor | None = None):
+        """Run the interactive demo loop.
+
+        Args:
+            initial_image: Initial image to start from (H, W, 3) numpy or (1, 3, H, W) tensor
+        """
         if self.pipeline is None:
             raise RuntimeError("Pipeline not set")
 
@@ -226,6 +230,18 @@ class InteractiveApp:
         # Warmup
         print("Warming up pipeline...")
         self.pipeline.warmup(num_iterations=3)
+
+        # Set initial frame after warmup (warmup calls reset)
+        if initial_image is not None:
+            self.pipeline.set_initial_frame(initial_image)
+        else:
+            # Use random initial frame for testing
+            dummy_frame = torch.randn(
+                1, 3, self.pipeline.config.height, self.pipeline.config.width,
+                device=self.pipeline.device, dtype=self.pipeline.dtype
+            )
+            self.pipeline.set_initial_frame(dummy_frame)
+
         print("Ready!")
 
         frame_time = 1.0 / self.config.target_fps
@@ -429,6 +445,7 @@ def run_demo(
     app = InteractiveApp(config, pipeline)
 
     # Load initial image
+    img = None
     if initial_image:
         print(f"Loading initial image from {initial_image}...")
         try:
@@ -440,16 +457,14 @@ def run_demo(
             img = imageio.imread(initial_image)
 
         img = img.astype(np.float32) / 255.0
-        app.set_initial_image(img)
     else:
         # Use random initial image for testing
         print("Using random initial image...")
         img = np.random.rand(480, 640, 3).astype(np.float32)
-        app.set_initial_image(img)
 
-    # Run
+    # Run (pass initial image to set after warmup)
     print("Starting demo...")
-    app.run()
+    app.run(initial_image=img)
 
 
 class MockVAE:

@@ -44,6 +44,18 @@ all = [
     "pytest-asyncio>=0.24.0",
 ]
 
+[tool.uv]
+extra-index-url = ["https://pypi.org/simple"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
