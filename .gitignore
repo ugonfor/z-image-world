@@ -42,3 +42,8 @@ build/
 # Misc
 *.log
 bin/
+
+# Demo outputs
+demo_output/
+*_output.png
+*.gif
