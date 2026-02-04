@@ -45,5 +45,14 @@ bin/
 
 # Demo outputs
 demo_output/
+demo_output_full/
 *_output.png
 *.gif
+
+# Inference outputs
+inference_output/
+inference_test/
+my_demo/
+
+# Training data (generated)
+data/videos/
