@@ -69,7 +69,7 @@ class VideoFolderDataset(Dataset):
         self.num_frames = num_frames
         self.resolution = resolution
         self.video_paths = sorted(
-            p for p in self.data_dir.iterdir()
+            p for p in self.data_dir.rglob("*")
             if p.suffix.lower() in {".mp4", ".avi", ".mov", ".webm"}
         )
         if not self.video_paths:
