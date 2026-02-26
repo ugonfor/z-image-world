@@ -99,62 +99,52 @@ def generate_frames(model, args, device):
         with torch.no_grad():
             start_latent = model.encode_frames(img_tensor)  # (1, 1, 16, H//8, W//8)
 
-    # Setup noise schedule for DDIM denoising
-    betas = torch.linspace(0.0001, 0.02, 1000, device=device)
-    alphas = 1.0 - betas
-    alphas_cumprod = torch.cumprod(alphas, dim=0)
-
+    # Setup Flow Matching Euler schedule (matching Z-Image's scheduler)
+    # Z-Image uses FlowMatchEulerDiscreteScheduler with shift=3.0
     num_denoise_steps = args.denoise_steps
-    step_ratio = 1000 // max(num_denoise_steps, 1)
-    denoise_timesteps = (torch.arange(num_denoise_steps, device=device) * step_ratio).flip(0).long()
 
-    def ddim_denoise_frame(model, context_latents, noise, action_seq):
-        """Proper DDIM denoising with v-prediction."""
+    # Compute sigmas with shift (matching Z-Image)
+    shift = 3.0
+    base_sigmas = torch.linspace(1.0, 0.0, num_denoise_steps + 1, device=device)
+    sigmas = shift * base_sigmas / (1 + (shift - 1) * base_sigmas)
+    # Corresponding DDPM-style timesteps (sigmas * 1000)
+    denoise_timesteps = (sigmas[:-1] * 1000).long()
+
+    def flow_match_denoise_frame(model, context_latents, noise, action_seq):
+        """Flow Matching Euler denoising (matching Z-Image)."""
         x_t = noise  # (1, 16, H, W)
         ctx_len = context_latents.shape[1] if context_latents is not None else 0
 
-        for step_idx, t in enumerate(denoise_timesteps):
-            # Build sequence: [context (clean, t=0) | current (noisy, t=t)]
+        for step_idx in range(num_denoise_steps):
+            sigma = sigmas[step_idx]
+            sigma_next = sigmas[step_idx + 1]
+            dt = sigma_next - sigma  # Negative (sigma decreasing)
+
+            # Z-Image timestep format: DDPM-style, model handles normalization
+            t_val = denoise_timesteps[step_idx].float()
+
+            # Build sequence: [context (clean, t=0) | current (noisy)]
             if context_latents is not None:
                 full_seq = torch.cat([context_latents, x_t.unsqueeze(1)], dim=1)
                 t_ctx = torch.zeros(1, ctx_len, device=device)
-                t_cur = t.float().unsqueeze(0).unsqueeze(0)
+                t_cur = t_val.unsqueeze(0).unsqueeze(0)
                 timesteps = torch.cat([t_ctx, t_cur], dim=1)
             else:
                 full_seq = x_t.unsqueeze(1)
-                timesteps = t.float().unsqueeze(0).unsqueeze(0)
+                timesteps = t_val.unsqueeze(0).unsqueeze(0)
 
-            # Forward pass: model predicts v (velocity)
-            v_pred = model(full_seq, timesteps, actions=action_seq)
-            if v_pred.dim() == 5:
-                v_pred = v_pred[:, -1]  # Take last frame prediction
+            # Forward pass: model predicts flow matching velocity
+            velocity = model(full_seq, timesteps, actions=action_seq)
+            if velocity.dim() == 5:
+                velocity = velocity[:, -1]
 
-            # Convert v-prediction to x0 estimate
-            # v = sqrt(alpha) * epsilon - sqrt(1-alpha) * x0
-            # x_t = sqrt(alpha) * x0 + sqrt(1-alpha) * epsilon
-            # => x0 = sqrt(alpha) * x_t - sqrt(1-alpha) * v
-            alpha_t = alphas_cumprod[t]
-            sqrt_alpha = alpha_t.sqrt()
-            sqrt_one_minus_alpha = (1 - alpha_t).sqrt()
-            x0_pred = sqrt_alpha * x_t - sqrt_one_minus_alpha * v_pred
-
-            if step_idx < len(denoise_timesteps) - 1:
-                # DDIM step to next timestep
-                t_next = denoise_timesteps[step_idx + 1]
-                alpha_next = alphas_cumprod[t_next]
-                sqrt_alpha_next = alpha_next.sqrt()
-                sqrt_one_minus_next = (1 - alpha_next).sqrt()
-
-                # Compute noise direction
-                eps_pred = (x_t - sqrt_alpha * x0_pred) / sqrt_one_minus_alpha.clamp(min=1e-8)
-                x_t = sqrt_alpha_next * x0_pred + sqrt_one_minus_next * eps_pred
-            else:
-                x_t = x0_pred
+            # Euler step: x_{t+dt} = x_t + dt * velocity
+            x_t = x_t + dt * velocity
 
         return x_t
 
     # Generate frames autoregressively
-    print(f"\nGenerating {num_frames} frames at {resolution}x{resolution} ({num_denoise_steps}-step DDIM)...")
+    print(f"\nGenerating {num_frames} frames at {resolution}x{resolution} ({num_denoise_steps}-step Flow Match Euler)...")
     generated_latents = []
     t_start = time.time()
 
@@ -183,9 +173,9 @@ def generate_frames(model, args, device):
                 pad = torch.full((1, ctx_len + 1 - frame_actions.shape[1]), 8, device=device)
                 frame_actions = torch.cat([pad, frame_actions], dim=1)
 
-        # Denoise
+        # Denoise using Flow Matching Euler steps
         with torch.no_grad():
-            clean_latent = ddim_denoise_frame(model, context_latents, noise, frame_actions)
+            clean_latent = flow_match_denoise_frame(model, context_latents, noise, frame_actions)
 
         generated_latents.append(clean_latent)
 

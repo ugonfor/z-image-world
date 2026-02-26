@@ -84,15 +84,15 @@ class ZImageWorldPipeline:
         self._last_step_time = 0.0
 
     def _setup_scheduler(self):
-        """Setup DDIM noise schedule for inference."""
+        """Setup Flow Matching Euler schedule (matching Z-Image)."""
         num_steps = self.config.num_inference_steps
-        betas = torch.linspace(0.0001, 0.02, 1000, device=self.device)
-        alphas = 1.0 - betas
-        self.alphas_cumprod = torch.cumprod(alphas, dim=0)
+        shift = 3.0
 
-        # Timestep schedule (evenly spaced)
-        step_ratio = 1000 // max(num_steps, 1)
-        self.timesteps = (torch.arange(num_steps, device=self.device) * step_ratio).flip(0).long()
+        # Compute sigmas with shift (matching Z-Image's FlowMatchEulerDiscreteScheduler)
+        base_sigmas = torch.linspace(1.0, 0.0, num_steps + 1, device=self.device)
+        self.sigmas = shift * base_sigmas / (1 + (shift - 1) * base_sigmas)
+        # DDPM-style timesteps for the model
+        self.timesteps = (self.sigmas[:-1] * 1000).long()
 
     @classmethod
     def from_pretrained(
@@ -204,49 +204,31 @@ class ZImageWorldPipeline:
         action_ids = list(self._actions)[-ctx_len:] + [action]
         action_tensor = torch.tensor([action_ids], device=self.device)
 
-        # Denoising loop
+        # Flow Matching Euler denoising loop
         x_t = noise[:, 0]  # (1, 16, H//8, W//8)
 
-        for step_idx, t in enumerate(self.timesteps):
-            # Build full sequence: [context (clean) | current (noisy)]
-            full_latents = torch.cat([context_tensor, x_t.unsqueeze(1)], dim=1)  # (1, ctx+1, 16, H, W)
+        for step_idx in range(len(self.timesteps)):
+            sigma = self.sigmas[step_idx]
+            sigma_next = self.sigmas[step_idx + 1]
+            dt = sigma_next - sigma  # Negative (decreasing)
+
+            t_val = self.timesteps[step_idx].float()
+
+            # Build full sequence: [context (clean, t=0) | current (noisy)]
+            full_latents = torch.cat([context_tensor, x_t.unsqueeze(1)], dim=1)
 
             # Timesteps: context = 0 (clean), current = t
             t_context = torch.zeros(1, ctx_len, device=self.device)
-            t_current = t.float().unsqueeze(0).unsqueeze(0)
+            t_current = t_val.unsqueeze(0).unsqueeze(0)
             timesteps = torch.cat([t_context, t_current], dim=1)
 
-            # Forward pass
-            pred = self.model(full_latents, timesteps, actions=action_tensor)
+            # Forward pass: model predicts flow matching velocity
+            velocity = self.model(full_latents, timesteps, actions=action_tensor)
+            if velocity.dim() == 5:
+                velocity = velocity[:, -1]
 
-            # Extract prediction for the new frame (last in sequence)
-            if pred.dim() == 5:
-                v_pred = pred[:, -1]  # (1, 16, H//8, W//8)
-            else:
-                v_pred = pred
-
-            # DDIM step (v-prediction to sample)
-            alpha_t = self.alphas_cumprod[t]
-            sqrt_alpha = alpha_t.sqrt()
-            sqrt_one_minus_alpha = (1 - alpha_t).sqrt()
-
-            # v = sqrt(alpha) * noise - sqrt(1-alpha) * sample
-            # => sample = (sqrt(alpha) * noise - v) / sqrt(1-alpha)  ... if v_pred
-            # Simplified: predict x0 from v
-            x0_pred = sqrt_alpha * x_t - sqrt_one_minus_alpha * v_pred
-
-            if step_idx < len(self.timesteps) - 1:
-                # Next timestep
-                t_next = self.timesteps[step_idx + 1]
-                alpha_next = self.alphas_cumprod[t_next]
-                sqrt_alpha_next = alpha_next.sqrt()
-                sqrt_one_minus_alpha_next = (1 - alpha_next).sqrt()
-
-                # DDIM: x_{t-1} = sqrt(alpha_{t-1}) * x0_pred + sqrt(1-alpha_{t-1}) * noise_direction
-                noise_direction = (x_t - sqrt_alpha * x0_pred) / sqrt_one_minus_alpha.clamp(min=1e-8)
-                x_t = sqrt_alpha_next * x0_pred + sqrt_one_minus_alpha_next * noise_direction
-            else:
-                x_t = x0_pred
+            # Euler step: x_{t+dt} = x_t + dt * velocity
+            x_t = x_t + dt * velocity
 
         # Decode to image
         decoded = self.model.decode_latents(x_t.unsqueeze(1))  # (1, 1, 3, H, W)
