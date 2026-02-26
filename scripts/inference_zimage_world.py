@@ -99,8 +99,62 @@ def generate_frames(model, args, device):
         with torch.no_grad():
             start_latent = model.encode_frames(img_tensor)  # (1, 1, 16, H//8, W//8)
 
+    # Setup noise schedule for DDIM denoising
+    betas = torch.linspace(0.0001, 0.02, 1000, device=device)
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+
+    num_denoise_steps = args.denoise_steps
+    step_ratio = 1000 // max(num_denoise_steps, 1)
+    denoise_timesteps = (torch.arange(num_denoise_steps, device=device) * step_ratio).flip(0).long()
+
+    def ddim_denoise_frame(model, context_latents, noise, action_seq):
+        """Proper DDIM denoising with v-prediction."""
+        x_t = noise  # (1, 16, H, W)
+        ctx_len = context_latents.shape[1] if context_latents is not None else 0
+
+        for step_idx, t in enumerate(denoise_timesteps):
+            # Build sequence: [context (clean, t=0) | current (noisy, t=t)]
+            if context_latents is not None:
+                full_seq = torch.cat([context_latents, x_t.unsqueeze(1)], dim=1)
+                t_ctx = torch.zeros(1, ctx_len, device=device)
+                t_cur = t.float().unsqueeze(0).unsqueeze(0)
+                timesteps = torch.cat([t_ctx, t_cur], dim=1)
+            else:
+                full_seq = x_t.unsqueeze(1)
+                timesteps = t.float().unsqueeze(0).unsqueeze(0)
+
+            # Forward pass: model predicts v (velocity)
+            v_pred = model(full_seq, timesteps, actions=action_seq)
+            if v_pred.dim() == 5:
+                v_pred = v_pred[:, -1]  # Take last frame prediction
+
+            # Convert v-prediction to x0 estimate
+            # v = sqrt(alpha) * epsilon - sqrt(1-alpha) * x0
+            # x_t = sqrt(alpha) * x0 + sqrt(1-alpha) * epsilon
+            # => x0 = sqrt(alpha) * x_t - sqrt(1-alpha) * v
+            alpha_t = alphas_cumprod[t]
+            sqrt_alpha = alpha_t.sqrt()
+            sqrt_one_minus_alpha = (1 - alpha_t).sqrt()
+            x0_pred = sqrt_alpha * x_t - sqrt_one_minus_alpha * v_pred
+
+            if step_idx < len(denoise_timesteps) - 1:
+                # DDIM step to next timestep
+                t_next = denoise_timesteps[step_idx + 1]
+                alpha_next = alphas_cumprod[t_next]
+                sqrt_alpha_next = alpha_next.sqrt()
+                sqrt_one_minus_next = (1 - alpha_next).sqrt()
+
+                # Compute noise direction
+                eps_pred = (x_t - sqrt_alpha * x0_pred) / sqrt_one_minus_alpha.clamp(min=1e-8)
+                x_t = sqrt_alpha_next * x0_pred + sqrt_one_minus_next * eps_pred
+            else:
+                x_t = x0_pred
+
+        return x_t
+
     # Generate frames autoregressively
-    print(f"\nGenerating {num_frames} frames at {resolution}x{resolution}...")
+    print(f"\nGenerating {num_frames} frames at {resolution}x{resolution} ({num_denoise_steps}-step DDIM)...")
     generated_latents = []
     t_start = time.time()
 
@@ -110,48 +164,30 @@ def generate_frames(model, args, device):
             generated_latents.append(start_latent[:, 0])  # (1, 16, H, W)
             continue
 
-        # Generate noisy latent
+        # Generate noise for new frame
         noise = torch.randn(1, 16, latent_h, latent_w, device=device, dtype=torch.bfloat16)
 
-        # Context: use previous frames for temporal conditioning
+        # Context: use previous frames
+        context_latents = None
         if generated_latents:
-            # Stack context + current noise as a sequence
-            context = torch.stack(generated_latents[-args.context_frames:], dim=1)  # (1, C, 16, H, W)
-            full_seq = torch.cat([context, noise.unsqueeze(1)], dim=1)  # (1, C+1, 16, H, W)
+            context = generated_latents[-args.context_frames:]
+            context_latents = torch.stack(context, dim=1)  # (1, C, 16, H, W)
 
-            # Timesteps: context frames are "clean" (t=0), current is noisy
-            ctx_len = context.shape[1]
-            t_ctx = torch.zeros(1, ctx_len, device=device)
-            t_noise = torch.tensor([[999.0]], device=device)
-            timesteps = torch.cat([t_ctx, t_noise], dim=1)
+        # Actions for context window
+        frame_actions = None
+        if actions is not None and context_latents is not None:
+            ctx_len = context_latents.shape[1]
+            start_idx = max(0, f - ctx_len)
+            frame_actions = actions[:, start_idx : f + 1]
+            if frame_actions.shape[1] < ctx_len + 1:
+                pad = torch.full((1, ctx_len + 1 - frame_actions.shape[1]), 8, device=device)
+                frame_actions = torch.cat([pad, frame_actions], dim=1)
 
-            # Actions for this context window
-            frame_actions = None
-            if actions is not None:
-                start_idx = max(0, f - ctx_len)
-                frame_actions = actions[:, start_idx : f + 1]
-                # Pad if needed
-                if frame_actions.shape[1] < ctx_len + 1:
-                    pad = torch.full(
-                        (1, ctx_len + 1 - frame_actions.shape[1]),
-                        8, device=device,
-                    )
-                    frame_actions = torch.cat([pad, frame_actions], dim=1)
+        # Denoise
+        with torch.no_grad():
+            clean_latent = ddim_denoise_frame(model, context_latents, noise, frame_actions)
 
-            with torch.no_grad():
-                # Simple single-step denoising for now
-                pred = model(full_seq, timesteps, actions=frame_actions)
-
-            # Take the last frame's prediction
-            generated_latents.append(pred[:, -1])  # (1, 16, H, W)
-        else:
-            # No context, single-frame denoising
-            with torch.no_grad():
-                timestep = torch.tensor([999.0], device=device)
-                pred = model(noise.unsqueeze(1), timestep)
-            if pred.dim() == 5:
-                pred = pred[:, 0]
-            generated_latents.append(pred)
+        generated_latents.append(clean_latent)
 
         if (f + 1) % 5 == 0 or f == num_frames - 1:
             elapsed = time.time() - t_start
@@ -211,6 +247,7 @@ def main():
     parser.add_argument("--actions", type=str, default=None, help="Comma-separated action sequence")
     parser.add_argument("--checkpoint", type=str, default=None, help="Trained checkpoint path")
     parser.add_argument("--temporal_every_n", type=int, default=1, help="Temporal attention frequency")
+    parser.add_argument("--denoise_steps", type=int, default=4, help="Number of DDIM denoising steps")
     parser.add_argument("--context_frames", type=int, default=3, help="Number of context frames")
     parser.add_argument("--output_dir", type=str, default="inference_output/zimage_world", help="Output directory")
     parser.add_argument("--save_gif", action="store_true", help="Save as GIF")
