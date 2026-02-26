@@ -295,8 +295,16 @@ class ZImageWorldModel(nn.Module):
         num_heads: int = ZIMAGE_NUM_HEADS,
         max_frames: int = 16,
         action_injection_layers: list[int] | None = None,
+        temporal_every_n: int = 1,
         freeze_spatial: bool = True,
     ):
+        """Initialize ZImageWorldModel.
+
+        Args:
+            temporal_every_n: Apply temporal attention every N layers.
+                1 = every layer (default, 1965M trainable params),
+                2 = every other layer (~983M), 3 = every 3rd (~655M).
+        """
         super().__init__()
 
         self.transformer = transformer
@@ -304,6 +312,7 @@ class ZImageWorldModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.max_frames = max_frames
+        self.temporal_every_n = temporal_every_n
 
         if action_injection_layers is None:
             # Inject at 1/4, 1/2, 3/4 depth
@@ -314,15 +323,16 @@ class ZImageWorldModel(nn.Module):
             ]
         self.action_injection_layer_indices = set(action_injection_layers)
 
-        # Temporal attention layers (one per transformer block)
-        self.temporal_layers = nn.ModuleList([
-            TemporalAttention(
+        # Temporal attention layers (at every Nth transformer block)
+        self.temporal_layer_indices = set(range(0, num_layers, temporal_every_n))
+        self.temporal_layers = nn.ModuleDict({
+            str(i): TemporalAttention(
                 hidden_dim=hidden_dim,
                 num_heads=num_heads,
                 max_frames=max_frames,
             )
-            for _ in range(num_layers)
-        ])
+            for i in self.temporal_layer_indices
+        })
 
         # Action injection layers (at specified depths)
         self.action_injections = nn.ModuleDict({
@@ -618,6 +628,10 @@ class ZImageWorldModel(nn.Module):
             unified_attn_mask[i, :sl] = 1
 
         # Image token count (same for all frames since same spatial size)
+        # Assert all frames have the same number of image tokens
+        assert all(s == x_item_seqlens[0] for s in x_item_seqlens), (
+            f"All frames must have the same spatial size, got varying seqlens: {x_item_seqlens}"
+        )
         img_len = x_item_seqlens[0]
 
         # --- Main transformer blocks with temporal + action injection ---
@@ -625,19 +639,20 @@ class ZImageWorldModel(nn.Module):
             # Z-Image spatial block
             unified = layer(unified, unified_attn_mask, unified_freqs, adaln_input)
 
-            # Temporal attention (only on image tokens)
-            if num_frames > 1:
+            # Temporal attention (only on image tokens, at configured layers)
+            if num_frames > 1 and str(i) in self.temporal_layers:
                 img_tokens = unified[:, :img_len]  # (B*F, img_len, D)
-                img_tokens = self.temporal_layers[i](img_tokens, num_frames)
+                img_tokens = self.temporal_layers[str(i)](img_tokens, num_frames)
                 unified = torch.cat([img_tokens.to(unified.dtype), unified[:, img_len:]], dim=1)
 
-            # Action injection
+            # Action injection (per-frame: each frame sees only its own action)
             if str(i) in self.action_injections and action_cond is not None:
                 img_tokens = unified[:, :img_len]
-                action_expanded = repeat(
-                    action_cond, "b f d -> (b repeat) f d", repeat=num_frames
-                )
-                img_tokens = self.action_injections[str(i)](img_tokens, action_expanded)
+                # action_cond is (B, F, D). Reshape to (B*F, 1, D) so each
+                # frame's image tokens cross-attend to only its own action.
+                # This prevents future action leakage.
+                action_per_frame = rearrange(action_cond, "b f d -> (b f) 1 d")
+                img_tokens = self.action_injections[str(i)](img_tokens, action_per_frame)
                 unified = torch.cat([img_tokens.to(unified.dtype), unified[:, img_len:]], dim=1)
 
         # --- Final layer ---
@@ -662,6 +677,7 @@ class ZImageWorldModel(nn.Module):
         model_name_or_path: str = "Tongyi-MAI/Z-Image-Turbo",
         torch_dtype: torch.dtype = torch.bfloat16,
         action_injection_layers: list[int] | None = None,
+        temporal_every_n: int = 1,
         freeze_spatial: bool = True,
         device: str = "cuda",
     ) -> "ZImageWorldModel":
@@ -697,6 +713,7 @@ class ZImageWorldModel(nn.Module):
             vae=vae,
             num_layers=num_layers,
             action_injection_layers=action_injection_layers,
+            temporal_every_n=temporal_every_n,
             freeze_spatial=freeze_spatial,
         )
 
