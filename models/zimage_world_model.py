@@ -700,7 +700,7 @@ class ZImageWorldModel(nn.Module):
             freeze_spatial=freeze_spatial,
         )
 
-        model = model.to(device)
+        model = model.to(device=device, dtype=torch_dtype)
 
         trainable = model.num_trainable_params()
         total = model.num_total_params()
