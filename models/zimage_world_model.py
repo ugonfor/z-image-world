@@ -416,8 +416,8 @@ class ZImageWorldModel(nn.Module):
         else:
             latents = posterior
 
-        # Scale
-        latents = latents * self.vae.config.scaling_factor
+        # Scale (Z-Image uses scaling_factor=0.3611 and shift_factor=0.1159)
+        latents = (latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
 
         return rearrange(latents, "(b f) c h w -> b f c h w", b=batch, f=num_frames)
 
@@ -438,8 +438,8 @@ class ZImageWorldModel(nn.Module):
             batch, num_frames = latents.shape[0], 1
             latents_flat = latents
 
-        # Unscale
-        latents_flat = latents_flat / self.vae.config.scaling_factor
+        # Unscale (reverse of encoding: latent / scaling_factor + shift_factor)
+        latents_flat = latents_flat / self.vae.config.scaling_factor + self.vae.config.shift_factor
 
         # Decode
         images = self.vae.decode(latents_flat)
@@ -693,6 +693,9 @@ class ZImageWorldModel(nn.Module):
         # unpatchify returns List[(C, F=1, H, W)], we need (B*F, C, H, W)
         output = torch.stack(output, dim=0)  # (B*F, C, 1, H, W)
         output = output.squeeze(2)  # (B*F, C, H, W)
+
+        # Z-Image outputs negative of the expected velocity
+        output = -output
 
         return output
 
