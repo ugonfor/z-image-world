@@ -212,7 +212,7 @@ def train(args):
             noisy_latents = loss_fn.add_noise(latents, noise, timesteps)
 
             # Forward pass
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            with torch.amp.autocast(device, dtype=torch.bfloat16, enabled=(device == "cuda")):
                 # ZImageWorldModel.forward returns just the prediction (no cache tuple)
                 model_output = model(noisy_latents, timesteps.float())
 
@@ -234,6 +234,13 @@ def train(args):
                 optimizer.step()
                 optimizer.zero_grad()
                 global_step += 1
+
+        # Flush remaining gradients from partial batch
+        if (batch_idx + 1) % grad_accum != 0:
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            global_step += 1
 
         # End of epoch
         elapsed = time.time() - t_start
