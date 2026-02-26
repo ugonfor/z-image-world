@@ -629,7 +629,7 @@ class ZImageWorldModel(nn.Module):
             if num_frames > 1:
                 img_tokens = unified[:, :img_len]  # (B*F, img_len, D)
                 img_tokens = self.temporal_layers[i](img_tokens, num_frames)
-                unified = torch.cat([img_tokens, unified[:, img_len:]], dim=1)
+                unified = torch.cat([img_tokens.to(unified.dtype), unified[:, img_len:]], dim=1)
 
             # Action injection
             if str(i) in self.action_injections and action_cond is not None:
@@ -638,7 +638,7 @@ class ZImageWorldModel(nn.Module):
                     action_cond, "b f d -> (b repeat) f d", repeat=num_frames
                 )
                 img_tokens = self.action_injections[str(i)](img_tokens, action_expanded)
-                unified = torch.cat([img_tokens, unified[:, img_len:]], dim=1)
+                unified = torch.cat([img_tokens.to(unified.dtype), unified[:, img_len:]], dim=1)
 
         # --- Final layer ---
         final_layer = transformer.all_final_layer[f"{patch_size}-{f_patch_size}"]
