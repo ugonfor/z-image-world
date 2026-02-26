@@ -649,8 +649,10 @@ class ZImageWorldModel(nn.Module):
         x_size_list = list(x_size) if isinstance(x_size, (list, tuple)) else x_size
         output = transformer.unpatchify(unified_split, x_size_list, patch_size, f_patch_size)
 
-        # Stack back into tensor
-        output = torch.stack(output, dim=0)  # (B*F, C, H, W)
+        # Stack back into tensor and squeeze the F=1 dimension from unpatchify
+        # unpatchify returns List[(C, F=1, H, W)], we need (B*F, C, H, W)
+        output = torch.stack(output, dim=0)  # (B*F, C, 1, H, W)
+        output = output.squeeze(2)  # (B*F, C, H, W)
 
         return output
 
