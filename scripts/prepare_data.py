@@ -149,9 +149,9 @@ def generate_synthetic_videos(
             y, x = np.ogrid[:resolution, :resolution]
             mask = (x - cx) ** 2 + (y - cy) ** 2 < radius ** 2
             color = [
-                int(200 + 55 * np.sin(i * 1.1)),
-                int(100 + 155 * np.cos(i * 0.7)),
-                int(150 + 105 * np.sin(i * 1.3)),
+                max(0, min(255, int(200 + 55 * np.sin(i * 1.1)))),
+                max(0, min(255, int(100 + 155 * np.cos(i * 0.7)))),
+                max(0, min(255, int(150 + 105 * np.sin(i * 1.3)))),
             ]
             frame[mask] = color
 
