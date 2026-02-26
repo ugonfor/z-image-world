@@ -2,6 +2,7 @@
 from .action_encoder import ActionEncoder, ActionSpace
 from .causal_dit import CausalDiT, CausalAttention
 from .stream_vae import StreamVAE
+from .zimage_world_model import ZImageWorldModel
 
 __all__ = [
     "ActionEncoder",
@@ -9,4 +10,5 @@ __all__ = [
     "CausalDiT",
     "CausalAttention",
     "StreamVAE",
+    "ZImageWorldModel",
 ]
