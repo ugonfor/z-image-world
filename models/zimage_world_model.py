@@ -368,6 +368,12 @@ class ZImageWorldModel(nn.Module):
         for p in self.transformer.parameters():
             p.requires_grad_(True)
 
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for temporal layers to save memory."""
+        self._use_gradient_checkpointing = True
+        if hasattr(self.transformer, "gradient_checkpointing_enable"):
+            self.transformer.gradient_checkpointing_enable()
+
     def trainable_parameters(self) -> list[nn.Parameter]:
         """Return only trainable parameters (temporal + action layers)."""
         params = []
@@ -642,7 +648,13 @@ class ZImageWorldModel(nn.Module):
             # Temporal attention (only on image tokens, at configured layers)
             if num_frames > 1 and str(i) in self.temporal_layers:
                 img_tokens = unified[:, :img_len]  # (B*F, img_len, D)
-                img_tokens = self.temporal_layers[str(i)](img_tokens, num_frames)
+                if getattr(self, "_use_gradient_checkpointing", False) and self.training:
+                    img_tokens = torch.utils.checkpoint.checkpoint(
+                        self.temporal_layers[str(i)], img_tokens, num_frames,
+                        use_reentrant=False,
+                    )
+                else:
+                    img_tokens = self.temporal_layers[str(i)](img_tokens, num_frames)
                 unified = torch.cat([img_tokens.to(unified.dtype), unified[:, img_len:]], dim=1)
 
             # Action injection (per-frame: each frame sees only its own action)

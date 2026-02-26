@@ -69,7 +69,7 @@ class VideoFolderDataset(Dataset):
         self.num_frames = num_frames
         self.resolution = resolution
         self.video_paths = sorted(
-            p for p in self.data_dir.iterdir()
+            p for p in self.data_dir.rglob("*")
             if p.suffix.lower() in {".mp4", ".avi", ".mov", ".webm"}
         )
         if not self.video_paths:
@@ -132,10 +132,9 @@ def train(args):
 
     print(f"Trainable params: {model.num_trainable_params() / 1e6:.1f}M")
 
-    # Enable gradient checkpointing on transformer
-    if hasattr(model.transformer, "gradient_checkpointing_enable"):
-        model.transformer.gradient_checkpointing_enable()
-        print("Gradient checkpointing enabled")
+    # Enable gradient checkpointing on transformer and temporal layers
+    model.enable_gradient_checkpointing()
+    print("Gradient checkpointing enabled (transformer + temporal layers)")
 
     # --- Dataset ---
     print("\n=== Loading Dataset ===")
@@ -159,7 +158,7 @@ def train(args):
     )
     print(f"Dataset: {len(dataset)} samples, batch_size={args.batch_size}")
 
-    # --- Optimizer ---
+    # --- Optimizer + LR Scheduler ---
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
         trainable_params,
@@ -167,6 +166,27 @@ def train(args):
         weight_decay=0.01,
         betas=(0.9, 0.999),
     )
+
+    total_steps = args.epochs * len(dataset) // (args.batch_size * args.grad_accum)
+    warmup_steps = min(100, total_steps // 10)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(total_steps - warmup_steps, 1), eta_min=args.lr * 0.01,
+    )
+
+    # Resume from checkpoint
+    start_epoch = 0
+    global_step = 0
+    if args.resume and Path(args.resume).exists():
+        print(f"Resuming from {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device)
+        model.temporal_layers.load_state_dict(ckpt["temporal_state_dict"])
+        model.action_injections.load_state_dict(ckpt["action_injections_state_dict"])
+        model.action_encoder.load_state_dict(ckpt["action_encoder_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_epoch = ckpt.get("epoch", 0)
+        global_step = ckpt.get("global_step", 0)
+        print(f"  Resumed at epoch {start_epoch}, step {global_step}")
 
     # --- Loss function ---
     df_config = DiffusionForcingConfig(
@@ -191,9 +211,8 @@ def train(args):
     model.vae.eval()
 
     grad_accum = args.grad_accum
-    global_step = 0
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         epoch_loss = 0.0
         epoch_steps = 0
         t_start = time.time()
@@ -233,6 +252,7 @@ def train(args):
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
+                scheduler.step()
                 global_step += 1
 
         # Flush remaining gradients from partial batch
@@ -240,12 +260,14 @@ def train(args):
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
+            scheduler.step()
             global_step += 1
 
         # End of epoch
         elapsed = time.time() - t_start
         avg_loss = epoch_loss / max(epoch_steps, 1)
-        print(f"  Epoch {epoch + 1}/{args.epochs}: loss={avg_loss:.4f}, time={elapsed:.1f}s, steps={global_step}")
+        lr_now = scheduler.get_last_lr()[0]
+        print(f"  Epoch {epoch + 1}/{args.epochs}: loss={avg_loss:.4f}, lr={lr_now:.2e}, time={elapsed:.1f}s, steps={global_step}")
 
         # Save checkpoint periodically
         if (epoch + 1) % args.save_every == 0 or (epoch + 1) == args.epochs:
@@ -304,8 +326,18 @@ def main():
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/zimage_world", help="Checkpoint directory")
     parser.add_argument("--save_every", type=int, default=5, help="Save checkpoint every N epochs")
     parser.add_argument("--num_samples", type=int, default=50, help="Number of synthetic samples")
+    parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint path")
+    parser.add_argument("--download", action="store_true", help="Download video data before training")
     parser.add_argument("--quick", action="store_true", help="Quick test run")
     args = parser.parse_args()
+
+    # Auto download data if requested
+    if args.download:
+        from prepare_data import main as prepare_main
+        sys.argv = ["prepare_data.py", "--output-dir", args.data_dir or "data/videos"]
+        prepare_main()
+        if args.data_dir is None:
+            args.data_dir = "data/videos"
 
     if args.quick:
         args.epochs = 2
