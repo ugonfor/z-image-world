@@ -534,7 +534,8 @@ class ZImageWorldModel(nn.Module):
 
         # --- Prepare inputs as lists (Z-Image expects List[Tensor]) ---
         # Each frame is one item in the list
-        x_list = list(hidden_states.unbind(0))  # List of (C, H, W)
+        # Z-Image expects (C, F, H, W) per item where F=1 for images
+        x_list = [img.unsqueeze(1) for img in hidden_states.unbind(0)]  # List of (C, 1, H, W)
         # Null caption: single zero-vector per frame
         cap_list = [
             torch.zeros(1, ZIMAGE_CAP_FEAT_DIM, device=device, dtype=hidden_states.dtype)
