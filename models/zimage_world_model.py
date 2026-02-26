@@ -545,7 +545,20 @@ class ZImageWorldModel(nn.Module):
         f_patch_size = 1
 
         # --- Timestep embedding ---
-        t_scaled = timesteps * transformer.t_scale
+        # Z-Image expects timesteps normalized to [0, 1] where 0=noisy, 1=clean
+        # The pipeline does: t_norm = (1000 - t) / 1000
+        # Then t_embedder receives t_norm * t_scale (t_scale=1000)
+        # So for DDPM timestep 999 (most noisy): t_norm = (1000-999)/1000 = 0.001
+        # For DDPM timestep 0 (clean): t_norm = (1000-0)/1000 = 1.0
+        #
+        # If timesteps are already in [0, 1] (normalized), use directly.
+        # If in [0, 999] integer range (DDPM style), convert.
+        if timesteps.max() > 1.0:
+            # DDPM-style integer timesteps -> Z-Image normalized
+            t_normalized = (1000.0 - timesteps) / 1000.0
+        else:
+            t_normalized = timesteps
+        t_scaled = t_normalized * transformer.t_scale
         adaln_input = transformer.t_embedder(t_scaled)  # (B*F, 256)
 
         # --- Prepare inputs as lists (Z-Image expects List[Tensor]) ---
