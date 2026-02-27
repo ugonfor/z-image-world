@@ -147,12 +147,12 @@ class WorldModelInference:
             # Start from noise
             latent = torch.randn_like(current_latent)
 
-            # Denoise
+            # Denoise, conditioned on current frame
             for i, t in enumerate(timesteps):
                 t_tensor = torch.tensor([t], device=self.device)
 
-                # Predict noise
-                noise_pred = self.dit(latent, t_tensor)
+                # Predict noise conditioned on current frame
+                noise_pred = self.dit(latent, t_tensor, cond=current_latent)
 
                 # DDPM step
                 alpha = self.alphas_cumprod[t]
@@ -172,12 +172,12 @@ class WorldModelInference:
                 else:
                     latent = x0_pred
 
-            # Decode
+            # Decode for visualization
             frame = self.vae.decode(latent)
             generated_frames.append(frame.cpu())
 
-            # Update current latent for conditioning (if using)
-            current_latent = latent
+            # Stay in latent space for next frame's condition (avoid VAE roundtrip error)
+            current_latent = latent.detach()
 
         elapsed = time.perf_counter() - start_time
         fps = num_frames / elapsed
