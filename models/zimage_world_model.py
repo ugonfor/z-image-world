@@ -428,7 +428,8 @@ class ZImageWorldModel(nn.Module):
         })
         # Build list for compile-friendly indexed access (avoids dict lookup graph breaks)
         self._temporal_layer_list = [
-            self.temporal_layers.get(str(i)) for i in range(num_layers)
+            self.temporal_layers[str(i)] if str(i) in self.temporal_layers else None
+            for i in range(num_layers)
         ]
 
         # Action injection layers (at specified depths)
@@ -441,7 +442,8 @@ class ZImageWorldModel(nn.Module):
         })
         # Build list for compile-friendly indexed access
         self._action_injection_list = [
-            self.action_injections.get(str(i)) for i in range(num_layers)
+            self.action_injections[str(i)] if str(i) in self.action_injections else None
+            for i in range(num_layers)
         ]
 
         # Action encoder
@@ -655,9 +657,13 @@ class ZImageWorldModel(nn.Module):
         # Each frame is one item in the list
         # Z-Image expects (C, F, H, W) per item where F=1 for images
         x_list = [img.unsqueeze(1) for img in hidden_states.unbind(0)]  # List of (C, 1, H, W)
-        # Null caption: single zero-vector per frame
+        # Null caption: zero-vector(s) per frame.
+        # cap length must be a multiple of SEQ_MULTI_OF=32 to avoid RoPE position ID mismatch
+        # in patchify_and_embed (non-multiple lengths cause incorrect pos_id generation).
+        cap_feat_dim = getattr(transformer.config, "cap_feat_dim", ZIMAGE_CAP_FEAT_DIM)
+        _SEQ_MULTI_OF = 32  # matches diffusers SEQ_MULTI_OF constant
         cap_list = [
-            torch.zeros(1, ZIMAGE_CAP_FEAT_DIM, device=device, dtype=hidden_states.dtype)
+            torch.zeros(_SEQ_MULTI_OF, cap_feat_dim, device=device, dtype=hidden_states.dtype)
             for _ in range(bf)
         ]
 

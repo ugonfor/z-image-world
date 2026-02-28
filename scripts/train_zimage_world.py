@@ -80,9 +80,11 @@ class VideoFolderDataset(Dataset):
         return len(self.video_paths)
 
     def __getitem__(self, idx):
-        import cv2
-        cap = cv2.VideoCapture(str(self.video_paths[idx]))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        import imageio
+        from PIL import Image as PILImage
+
+        reader = imageio.get_reader(str(self.video_paths[idx]), "ffmpeg")
+        total_frames = reader.count_frames()
 
         # Sample random contiguous frames
         if total_frames <= self.num_frames:
@@ -90,18 +92,23 @@ class VideoFolderDataset(Dataset):
         else:
             start = torch.randint(0, total_frames - self.num_frames, (1,)).item()
 
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start)
         frames = []
-        for _ in range(self.num_frames):
-            ret, frame = cap.read()
-            if not ret:
+        for fi in range(start, start + self.num_frames):
+            try:
+                frame = reader.get_data(fi)  # (H, W, 3) uint8
+            except (IndexError, Exception):
                 break
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(frame, (self.resolution, self.resolution))
-            frames.append(torch.from_numpy(frame).float() / 255.0)
-        cap.release()
+            # Resize to resolution
+            pil = PILImage.fromarray(frame).resize(
+                (self.resolution, self.resolution), PILImage.BILINEAR
+            )
+            import numpy as _np
+            frames.append(torch.from_numpy(_np.array(pil)).float() / 255.0)
+        reader.close()
 
         # Pad if we got fewer frames than needed
+        if not frames:
+            frames = [torch.zeros(self.resolution, self.resolution, 3)]
         while len(frames) < self.num_frames:
             frames.append(frames[-1].clone())
 
@@ -122,8 +129,9 @@ def train(args):
     print("\n=== Loading Z-Image World Model ===")
     from models.zimage_world_model import ZImageWorldModel
 
+    model_path = args.model_path if hasattr(args, "model_path") and args.model_path else "Tongyi-MAI/Z-Image-Turbo"
     model = ZImageWorldModel.from_pretrained(
-        "Tongyi-MAI/Z-Image-Turbo",
+        model_path,
         torch_dtype=torch.bfloat16,
         temporal_every_n=args.temporal_every_n,
         freeze_spatial=True,
@@ -329,6 +337,7 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint path")
     parser.add_argument("--download", action="store_true", help="Download video data before training")
     parser.add_argument("--quick", action="store_true", help="Quick test run")
+    parser.add_argument("--model_path", type=str, default=None, help="Local model path or HuggingFace model ID")
     args = parser.parse_args()
 
     # Auto download data if requested
