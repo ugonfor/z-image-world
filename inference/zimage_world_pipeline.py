@@ -64,7 +64,13 @@ class ZImageWorldPipeline:
             display(frame)
     """
 
-    def __init__(self, model, config: Optional[ZImageWorldConfig] = None):
+    def __init__(
+        self,
+        model,
+        config: Optional[ZImageWorldConfig] = None,
+        use_spatial_cache: bool = True,
+        max_context_frames: int = 4,
+    ):
         self.model = model
         self.config = config or ZImageWorldConfig()
 
@@ -77,6 +83,14 @@ class ZImageWorldPipeline:
 
         # Noise schedule
         self._setup_scheduler()
+
+        # Spatial feature cache for streaming inference
+        self._use_spatial_cache = use_spatial_cache
+        if use_spatial_cache:
+            self.model._setup_streaming(max_context_frames=max_context_frames)
+            self._spatial_cache = self.model._spatial_cache
+        else:
+            self._spatial_cache = None
 
         # Stats
         self._frame_count = 0
@@ -173,6 +187,22 @@ class ZImageWorldPipeline:
         self._frame_count = 0
         self._total_time = 0.0
 
+        # Populate spatial cache with initial frame features
+        if self._use_spatial_cache and self._spatial_cache is not None:
+            self._spatial_cache.reset()
+            self._populate_cache_from_latent(latent)
+
+    def _populate_cache_from_latent(self, latent: torch.Tensor):
+        """Collect and cache Z-Image spatial features for a context frame.
+
+        Args:
+            latent: (1, C, H//8, W//8) latent tensor at t=0.
+        """
+        h = latent.shape[-2]
+        w = latent.shape[-1]
+        layer_feats = self.model._collect_spatial_features(latent, height=h, width=w)
+        self._spatial_cache.add_frame(layer_feats)
+
     @torch.inference_mode()
     def step(self, action: int = 8) -> torch.Tensor:
         """Generate next frame given an action.
@@ -190,70 +220,95 @@ class ZImageWorldPipeline:
 
         self._actions.append(action)
 
-        # Get context latents
-        ctx_len = min(self.config.context_frames, len(self._latents))
-        context = list(self._latents)[-ctx_len:]
-        context_tensor = torch.stack(context, dim=1)  # (1, ctx_len, 16, H, W)
-
-        latent_shape = context[0].shape  # (1, 16, H//8, W//8)
+        latent_shape = self._latents[-1].shape  # (1, 16, H//8, W//8)
+        h = latent_shape[-2]
+        w = latent_shape[-1]
 
         # Start from noise
-        noise = torch.randn(1, 1, *latent_shape[1:], device=self.device, dtype=torch.bfloat16)
+        noise = torch.randn(1, *latent_shape[1:], device=self.device, dtype=torch.bfloat16)
+        x_t = noise  # (1, 16, H//8, W//8)
 
-        # Build action sequence for context + generation
-        action_ids = list(self._actions)[-ctx_len:] + [action]
-        action_tensor = torch.tensor([action_ids], device=self.device)
+        use_cached = (
+            self._use_spatial_cache
+            and self._spatial_cache is not None
+            and self._spatial_cache.is_populated
+        )
 
-        # Denoising loop
-        x_t = noise[:, 0]  # (1, 16, H//8, W//8)
+        if use_cached:
+            # --- Streaming mode: only process new frame, use cached context ---
+            # Encode action for the new frame only
+            action_tensor_1frame = torch.tensor([[action]], device=self.device)
+            action_cond = self.model.action_encoder(action_tensor_1frame)  # (1, 1, D)
 
-        for step_idx, t in enumerate(self.timesteps):
-            # Build full sequence: [context (clean) | current (noisy)]
-            full_latents = torch.cat([context_tensor, x_t.unsqueeze(1)], dim=1)  # (1, ctx+1, 16, H, W)
+            for step_idx, t in enumerate(self.timesteps):
+                t_tensor = t.float().unsqueeze(0)  # (1,)
 
-            # Timesteps: context = 0 (clean), current = t
-            t_context = torch.zeros(1, ctx_len, device=self.device)
-            t_current = t.float().unsqueeze(0).unsqueeze(0)
-            timesteps = torch.cat([t_context, t_current], dim=1)
+                v_pred = self.model._forward_cached(
+                    hidden_states=x_t,
+                    timesteps=t_tensor,
+                    action_cond=action_cond,
+                    spatial_cache=self._spatial_cache,
+                    height=h,
+                    width=w,
+                )
 
-            # Forward pass
-            pred = self.model(full_latents, timesteps, actions=action_tensor)
+                # DDIM update
+                alpha_t = self.alphas_cumprod[t]
+                sqrt_alpha = alpha_t.sqrt()
+                sqrt_one_minus_alpha = (1 - alpha_t).sqrt()
+                x0_pred = sqrt_alpha * x_t - sqrt_one_minus_alpha * v_pred
 
-            # Extract prediction for the new frame (last in sequence)
-            if pred.dim() == 5:
-                v_pred = pred[:, -1]  # (1, 16, H//8, W//8)
-            else:
-                v_pred = pred
+                if step_idx < len(self.timesteps) - 1:
+                    t_next = self.timesteps[step_idx + 1]
+                    alpha_next = self.alphas_cumprod[t_next]
+                    sqrt_alpha_next = alpha_next.sqrt()
+                    sqrt_one_minus_alpha_next = (1 - alpha_next).sqrt()
+                    noise_direction = (x_t - sqrt_alpha * x0_pred) / sqrt_one_minus_alpha.clamp(min=1e-8)
+                    x_t = sqrt_alpha_next * x0_pred + sqrt_one_minus_alpha_next * noise_direction
+                else:
+                    x_t = x0_pred
 
-            # DDIM step (v-prediction to sample)
-            alpha_t = self.alphas_cumprod[t]
-            sqrt_alpha = alpha_t.sqrt()
-            sqrt_one_minus_alpha = (1 - alpha_t).sqrt()
+            # Add denoised frame to spatial cache (it's now a new context frame at t=0)
+            self._populate_cache_from_latent(x_t)
 
-            # v = sqrt(alpha) * noise - sqrt(1-alpha) * sample
-            # => sample = (sqrt(alpha) * noise - v) / sqrt(1-alpha)  ... if v_pred
-            # Simplified: predict x0 from v
-            x0_pred = sqrt_alpha * x_t - sqrt_one_minus_alpha * v_pred
+        else:
+            # --- Standard mode: process all context frames together ---
+            ctx_len = min(self.config.context_frames, len(self._latents))
+            context = list(self._latents)[-ctx_len:]
+            context_tensor = torch.stack(context, dim=1)  # (1, ctx_len, 16, H, W)
 
-            if step_idx < len(self.timesteps) - 1:
-                # Next timestep
-                t_next = self.timesteps[step_idx + 1]
-                alpha_next = self.alphas_cumprod[t_next]
-                sqrt_alpha_next = alpha_next.sqrt()
-                sqrt_one_minus_alpha_next = (1 - alpha_next).sqrt()
+            action_ids = list(self._actions)[-ctx_len:] + [action]
+            action_tensor = torch.tensor([action_ids], device=self.device)
 
-                # DDIM: x_{t-1} = sqrt(alpha_{t-1}) * x0_pred + sqrt(1-alpha_{t-1}) * noise_direction
-                noise_direction = (x_t - sqrt_alpha * x0_pred) / sqrt_one_minus_alpha.clamp(min=1e-8)
-                x_t = sqrt_alpha_next * x0_pred + sqrt_one_minus_alpha_next * noise_direction
-            else:
-                x_t = x0_pred
+            for step_idx, t in enumerate(self.timesteps):
+                full_latents = torch.cat([context_tensor, x_t.unsqueeze(1)], dim=1)
+
+                t_context = torch.zeros(1, ctx_len, device=self.device)
+                t_current = t.float().unsqueeze(0).unsqueeze(0)
+                timesteps_seq = torch.cat([t_context, t_current], dim=1)
+
+                pred = self.model(full_latents, timesteps_seq, actions=action_tensor)
+
+                v_pred = pred[:, -1] if pred.dim() == 5 else pred
+
+                alpha_t = self.alphas_cumprod[t]
+                sqrt_alpha = alpha_t.sqrt()
+                sqrt_one_minus_alpha = (1 - alpha_t).sqrt()
+                x0_pred = sqrt_alpha * x_t - sqrt_one_minus_alpha * v_pred
+
+                if step_idx < len(self.timesteps) - 1:
+                    t_next = self.timesteps[step_idx + 1]
+                    alpha_next = self.alphas_cumprod[t_next]
+                    sqrt_alpha_next = alpha_next.sqrt()
+                    sqrt_one_minus_alpha_next = (1 - alpha_next).sqrt()
+                    noise_direction = (x_t - sqrt_alpha * x0_pred) / sqrt_one_minus_alpha.clamp(min=1e-8)
+                    x_t = sqrt_alpha_next * x0_pred + sqrt_one_minus_alpha_next * noise_direction
+                else:
+                    x_t = x0_pred
 
         # Decode to image
         decoded = self.model.decode_latents(x_t.unsqueeze(1))  # (1, 1, 3, H, W)
-        if decoded.dim() == 5:
-            frame = decoded[:, 0]  # (1, 3, H, W)
-        else:
-            frame = decoded
+        frame = decoded[:, 0] if decoded.dim() == 5 else decoded
 
         # Update buffers
         self._latents.append(x_t)

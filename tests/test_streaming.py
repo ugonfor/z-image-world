@@ -2,8 +2,9 @@
 
 import pytest
 import torch
+import torch.nn as nn
 
-from streaming import RollingKVCache, CacheConfig, MotionAwareNoiseController
+from streaming import RollingKVCache, CacheConfig, MotionAwareNoiseController, SpatialFeatureCache
 
 
 class TestRollingKVCache:
@@ -147,3 +148,145 @@ class TestMotionController:
 
         assert controller._prev_noise_level == controller.base_noise_level
         assert controller._prev_motion == 0.0
+
+
+class TestSpatialFeatureCache:
+    """Tests for SpatialFeatureCache."""
+
+    NUM_LAYERS = 4
+    B, N, D = 1, 16, 32  # Small dims for testing
+
+    def _make_layer_feats(self):
+        return [torch.randn(self.B, self.N, self.D) for _ in range(self.NUM_LAYERS)]
+
+    def test_empty_cache(self):
+        """New cache is empty."""
+        cache = SpatialFeatureCache(num_layers=self.NUM_LAYERS, max_context_frames=3)
+        assert not cache.is_populated
+        assert cache.num_context_frames == 0
+        assert cache.get_context_feats(0) is None
+
+    def test_add_one_frame(self):
+        """Adding a frame populates cache."""
+        cache = SpatialFeatureCache(num_layers=self.NUM_LAYERS, max_context_frames=3)
+        cache.add_frame(self._make_layer_feats())
+
+        assert cache.is_populated
+        assert cache.num_context_frames == 1
+        ctx = cache.get_context_feats(0)
+        assert ctx is not None
+        assert ctx.shape == (self.B, 1, self.N, self.D)
+
+    def test_multiple_frames_stacked(self):
+        """Multiple frames stacked along dim=1."""
+        cache = SpatialFeatureCache(num_layers=self.NUM_LAYERS, max_context_frames=3)
+        for _ in range(3):
+            cache.add_frame(self._make_layer_feats())
+
+        ctx = cache.get_context_feats(1)
+        assert ctx.shape == (self.B, 3, self.N, self.D)
+
+    def test_eviction_at_max_frames(self):
+        """Oldest frame is evicted when max exceeded."""
+        max_ctx = 2
+        cache = SpatialFeatureCache(num_layers=self.NUM_LAYERS, max_context_frames=max_ctx)
+        for _ in range(4):
+            cache.add_frame(self._make_layer_feats())
+
+        assert cache.num_context_frames == max_ctx
+        ctx = cache.get_context_feats(0)
+        assert ctx.shape[1] == max_ctx
+
+    def test_global_indices_monotone(self):
+        """Global frame indices increase monotonically."""
+        cache = SpatialFeatureCache(num_layers=self.NUM_LAYERS, max_context_frames=2)
+        for _ in range(3):
+            cache.add_frame(self._make_layer_feats())
+
+        # oldest_frame_global_idx should be 1 (frame 0 evicted)
+        assert cache.oldest_frame_global_idx == 1
+        assert cache.next_frame_global_idx == 3
+
+    def test_reset_clears_cache(self):
+        """Reset clears all cached data."""
+        cache = SpatialFeatureCache(num_layers=self.NUM_LAYERS, max_context_frames=3)
+        cache.add_frame(self._make_layer_feats())
+        cache.reset()
+
+        assert not cache.is_populated
+        assert cache.num_context_frames == 0
+        assert cache._frames_added == 0
+
+    def test_wrong_num_layers_raises(self):
+        """Adding wrong number of layers raises assertion."""
+        cache = SpatialFeatureCache(num_layers=self.NUM_LAYERS, max_context_frames=3)
+        wrong_feats = [torch.randn(self.B, self.N, self.D) for _ in range(self.NUM_LAYERS - 1)]
+        with pytest.raises(AssertionError):
+            cache.add_frame(wrong_feats)
+
+
+class TestTemporalAttentionWithContext:
+    """Tests for TemporalAttention.forward_with_context."""
+
+    B, N, D = 1, 8, 64
+    NUM_HEADS = 4
+    MAX_FRAMES = 16
+
+    @pytest.fixture
+    def temporal_attn(self):
+        from models.zimage_world_model import TemporalAttention
+        return TemporalAttention(
+            hidden_dim=self.D,
+            num_heads=self.NUM_HEADS,
+            max_frames=self.MAX_FRAMES,
+        )
+
+    def test_no_context_output_shape(self, temporal_attn):
+        """Single frame without context returns same shape."""
+        x_new = torch.randn(self.B, self.N, self.D)
+        out = temporal_attn.forward_with_context(x_new, None, new_frame_global_idx=0)
+        assert out.shape == x_new.shape
+
+    def test_with_context_output_shape(self, temporal_attn):
+        """With context frames output matches new frame shape."""
+        x_new = torch.randn(self.B, self.N, self.D)
+        context_feats = torch.randn(self.B, 3, self.N, self.D)
+        out = temporal_attn.forward_with_context(x_new, context_feats, new_frame_global_idx=3)
+        assert out.shape == x_new.shape
+
+    def test_zero_gamma_is_identity(self, temporal_attn):
+        """With zero gamma, output equals input (skip connection only)."""
+        # gamma is zero-initialized
+        x_new = torch.randn(self.B, self.N, self.D)
+        context_feats = torch.randn(self.B, 2, self.N, self.D)
+        out = temporal_attn.forward_with_context(x_new, context_feats, new_frame_global_idx=2)
+        # Output should be very close to input (gamma=0)
+        assert torch.allclose(out, x_new, atol=1e-5), "With gamma=0, output must equal input"
+
+    def test_causal_structure(self, temporal_attn):
+        """Changing context affects output when weights are non-zero."""
+        # Re-init all weights (normally zero-init for training stability)
+        nn.init.constant_(temporal_attn.gamma, 1.0)
+        nn.init.xavier_uniform_(temporal_attn.to_out.weight)
+        nn.init.zeros_(temporal_attn.to_out.bias)
+
+        x_new = torch.randn(self.B, self.N, self.D)
+
+        # Two different contexts
+        ctx_a = torch.randn(self.B, 2, self.N, self.D)
+        ctx_b = ctx_a.clone()
+        ctx_b[:, 0] = torch.randn(self.B, self.N, self.D)  # Modify oldest frame
+
+        out_a = temporal_attn.forward_with_context(x_new, ctx_a, new_frame_global_idx=2)
+        out_b = temporal_attn.forward_with_context(x_new, ctx_b, new_frame_global_idx=2)
+
+        # Different context → different output (new frame attends to all context)
+        assert not torch.allclose(out_a, out_b, atol=1e-5)
+
+    def test_global_idx_beyond_max_frames_clamped(self, temporal_attn):
+        """Global indices beyond max_frames are clamped, no IndexError."""
+        x_new = torch.randn(self.B, self.N, self.D)
+        context_feats = torch.randn(self.B, 2, self.N, self.D)
+        # global idx > max_frames (16) should not crash
+        out = temporal_attn.forward_with_context(x_new, context_feats, new_frame_global_idx=50)
+        assert out.shape == x_new.shape

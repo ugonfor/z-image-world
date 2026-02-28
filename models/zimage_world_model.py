@@ -22,6 +22,25 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 
+# nn.RMSNorm added in PyTorch 2.4; provide a compat shim for 2.3
+if hasattr(nn, "RMSNorm"):
+    _RMSNorm = nn.RMSNorm
+else:
+    class _RMSNorm(nn.Module):
+        def __init__(self, normalized_shape, eps=1e-6):
+            super().__init__()
+            if isinstance(normalized_shape, int):
+                normalized_shape = (normalized_shape,)
+            self.normalized_shape = tuple(normalized_shape)
+            self.eps = eps
+            self.weight = nn.Parameter(torch.ones(self.normalized_shape))
+
+        def forward(self, x):
+            variance = x.pow(2).mean(-1, keepdim=True)
+            x_norm = x * torch.rsqrt(variance + self.eps)
+            return self.weight * x_norm
+
+
 # Z-Image-Turbo architecture constants (from inspection)
 ZIMAGE_HIDDEN_DIM = 3840
 ZIMAGE_NUM_HEADS = 30
@@ -54,15 +73,15 @@ class TemporalAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
 
-        self.norm = nn.RMSNorm(hidden_dim)
+        self.norm = _RMSNorm(hidden_dim)
         self.to_q = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.to_k = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.to_v = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.to_out = nn.Linear(hidden_dim, hidden_dim)
 
         # QK-Norm (matching Z-Image)
-        self.norm_q = nn.RMSNorm(self.head_dim)
-        self.norm_k = nn.RMSNorm(self.head_dim)
+        self.norm_q = _RMSNorm(self.head_dim)
+        self.norm_k = _RMSNorm(self.head_dim)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -138,6 +157,73 @@ class TemporalAttention(nn.Module):
 
         return x + self.gamma * out
 
+    def forward_with_context(
+        self,
+        x_new: torch.Tensor,
+        context_feats: Optional[torch.Tensor],
+        new_frame_global_idx: int,
+    ) -> torch.Tensor:
+        """Streaming temporal attention: attend to cached context + new frame.
+
+        Args:
+            x_new: New frame's spatial hidden states (B, N, D).
+            context_feats: Cached context frames' spatial hidden states
+                           (B, T, N, D), or None if no context yet.
+            new_frame_global_idx: Absolute global index of the new frame.
+                Determines position embedding so evicted frames don't corrupt
+                positional information.
+
+        Returns:
+            New frame's temporally-attended hidden states (B, N, D).
+        """
+        B, N, D = x_new.shape
+        device = x_new.device
+
+        if context_feats is None:
+            # No context: single-frame temporal attention (gamma≈0 at init → ≈no-op)
+            T = 0
+            all_frames = x_new.unsqueeze(1)  # (B, 1, N, D)
+            global_indices = torch.tensor([new_frame_global_idx], device=device)
+        else:
+            T = context_feats.shape[1]
+            all_frames = torch.cat([context_feats, x_new.unsqueeze(1)], dim=1)  # (B, T+1, N, D)
+            # Absolute position indices: oldest context → newest new frame
+            start_idx = new_frame_global_idx - T
+            global_indices = torch.arange(start_idx, new_frame_global_idx + 1, device=device)  # (T+1,)
+
+        # Clamp to valid embedding range
+        global_indices = global_indices.clamp(0, self.frame_pos.num_embeddings - 1)
+
+        # Reshape for temporal attention: (B*N, T+1, D)
+        x_temporal = rearrange(all_frames, "b f n d -> (b n) f d")
+
+        # Add absolute position embeddings
+        x_temporal = x_temporal + self.frame_pos(global_indices).unsqueeze(0)
+
+        # Normalize
+        x_norm = self.norm(x_temporal)
+
+        # QKV
+        q = rearrange(self.to_q(x_norm), "b f (h d) -> b h f d", h=self.num_heads)
+        k = rearrange(self.to_k(x_norm), "b f (h d) -> b h f d", h=self.num_heads)
+        v = rearrange(self.to_v(x_norm), "b f (h d) -> b h f d", h=self.num_heads)
+
+        q = self.norm_q(q)
+        k = self.norm_k(k)
+
+        # Causal attention: new frame attends to all context; context doesn't see new frame
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        # Extract only the last frame (new frame) output
+        out = rearrange(out, "b h f d -> b f (h d)")
+        out_new = out[:, -1:]  # (B*N, 1, D)
+        out_new = self.to_out(out_new)
+
+        # Reshape to (B, N, D)
+        out_new = rearrange(out_new, "(b n) 1 d -> b n d", b=B, n=N)
+
+        return x_new + self.gamma * out_new
+
 
 class ZImageActionInjectionLayer(nn.Module):
     """Cross-attention for injecting action conditioning into Z-Image hidden states.
@@ -161,8 +247,8 @@ class ZImageActionInjectionLayer(nn.Module):
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
 
-        self.norm_x = nn.RMSNorm(hidden_dim)
-        self.norm_cond = nn.RMSNorm(hidden_dim)
+        self.norm_x = _RMSNorm(hidden_dim)
+        self.norm_cond = _RMSNorm(hidden_dim)
 
         self.to_q = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.to_k = nn.Linear(hidden_dim, hidden_dim, bias=False)
@@ -238,7 +324,7 @@ class ZImageActionEncoder(nn.Module):
             nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.RMSNorm(hidden_dim),
+            _RMSNorm(hidden_dim),
         )
 
         self._init_weights()
@@ -697,6 +783,294 @@ class ZImageWorldModel(nn.Module):
         # unpatchify returns List[(C, F=1, H, W)], we need (B*F, C, H, W)
         output = torch.stack(output, dim=0)  # (B*F, C, 1, H, W)
         output = output.squeeze(2)  # (B*F, C, H, W)
+
+        return output
+
+    # ------------------------------------------------------------------
+    # Streaming inference helpers (KV-cache via spatial feature caching)
+    # ------------------------------------------------------------------
+
+    def _setup_streaming(self, max_context_frames: int = 4):
+        """Initialize the spatial feature cache for streaming inference.
+
+        Call this once before starting a streaming inference session.
+        The cache is reset each time set_initial_frame-equivalent logic runs.
+
+        Args:
+            max_context_frames: Maximum context frames to keep in cache.
+        """
+        from streaming.spatial_feature_cache import SpatialFeatureCache
+
+        self._spatial_cache = SpatialFeatureCache(
+            num_layers=self.num_layers,
+            max_context_frames=max_context_frames,
+        )
+
+    @torch.no_grad()
+    def _collect_spatial_features(
+        self,
+        latent: torch.Tensor,
+        height: int,
+        width: int,
+    ) -> list[torch.Tensor]:
+        """Run a single frame through Z-Image at t=0 and collect per-layer
+        pre-temporal spatial hidden states.
+
+        Args:
+            latent: Single frame latent (1, C, H, W) or (B, C, H, W).
+            height: Spatial height (before patching).
+            width: Spatial width (before patching).
+
+        Returns:
+            List of (B, N, D) tensors, one per layer (only layers that have
+            TemporalAttention; other layers store None placeholder).
+        """
+        transformer = self.transformer
+        device = latent.device
+        dtype = latent.dtype
+        batch_size = latent.shape[0]
+        patch_size = 2
+        f_patch_size = 1
+
+        # Zero timestep (clean frame)
+        timestep = torch.zeros(batch_size, device=device)
+        t_scaled = timestep * transformer.t_scale
+        adaln_input = transformer.t_embedder(t_scaled)
+
+        # Prepare list inputs
+        x_list = [img.unsqueeze(1) for img in latent.unbind(0)]
+        cap_list = [
+            torch.zeros(1, ZIMAGE_CAP_FEAT_DIM, device=device, dtype=dtype)
+            for _ in range(batch_size)
+        ]
+
+        # Patchify and embed
+        (
+            x_patches, cap_feats,
+            x_size, x_pos_ids, cap_pos_ids,
+            x_inner_pad_mask, cap_inner_pad_mask,
+        ) = transformer.patchify_and_embed(x_list, cap_list, patch_size, f_patch_size)
+
+        x_item_seqlens = [len(p) for p in x_patches]
+        x_patches_cat = torch.cat(x_patches, dim=0)
+        x_patches_cat = transformer.all_x_embedder[f"{patch_size}-{f_patch_size}"](x_patches_cat)
+
+        adaln_input = adaln_input.type_as(x_patches_cat)
+        x_patches_cat[torch.cat(x_inner_pad_mask)] = transformer.x_pad_token
+        x_patches_split = list(x_patches_cat.split(x_item_seqlens, dim=0))
+        x_freqs_cis = list(
+            transformer.rope_embedder(torch.cat(x_pos_ids, dim=0))
+            .split([len(p) for p in x_pos_ids], dim=0)
+        )
+        x_padded = torch.stack(x_patches_split, dim=0)
+        x_freqs_padded = torch.stack(x_freqs_cis, dim=0)
+        x_max_seqlen = x_item_seqlens[0]
+        x_attn_mask = torch.ones((batch_size, x_max_seqlen), dtype=torch.bool, device=device)
+
+        # Noise refiner
+        for layer in transformer.noise_refiner:
+            x_padded = layer(x_padded, x_attn_mask, x_freqs_padded, adaln_input)
+
+        # Caption
+        cap_item_seqlens = [len(c) for c in cap_feats]
+        cap_feats_cat = torch.cat(cap_feats, dim=0)
+        cap_feats_cat = transformer.cap_embedder(cap_feats_cat)
+        cap_feats_cat[torch.cat(cap_inner_pad_mask)] = transformer.cap_pad_token
+        cap_feats_split = list(cap_feats_cat.split(cap_item_seqlens, dim=0))
+        cap_freqs_cis = list(
+            transformer.rope_embedder(torch.cat(cap_pos_ids, dim=0))
+            .split([len(p) for p in cap_pos_ids], dim=0)
+        )
+        cap_padded = torch.stack(cap_feats_split, dim=0)
+        cap_freqs_padded = torch.stack(cap_freqs_cis, dim=0)
+        cap_max_seqlen = cap_item_seqlens[0]
+        cap_attn_mask = torch.ones((batch_size, cap_max_seqlen), dtype=torch.bool, device=device)
+
+        for layer in transformer.context_refiner:
+            cap_padded = layer(cap_padded, cap_attn_mask, cap_freqs_padded)
+
+        # Unified stream
+        unified_list = []
+        unified_freqs_list = []
+        for i in range(batch_size):
+            xl = x_item_seqlens[i]
+            cl = cap_item_seqlens[i]
+            unified_list.append(torch.cat([x_padded[i, :xl], cap_padded[i, :cl]]))
+            unified_freqs_list.append(torch.cat([x_freqs_padded[i, :xl], cap_freqs_padded[i, :cl]]))
+
+        unified = torch.stack(unified_list, dim=0)
+        unified_freqs = torch.stack(unified_freqs_list, dim=0)
+        unified_attn_mask = torch.ones(
+            (batch_size, x_item_seqlens[0] + cap_item_seqlens[0]),
+            dtype=torch.bool, device=device,
+        )
+        img_len = x_item_seqlens[0]
+
+        # Main transformer blocks — collect pre-temporal img_tokens per layer
+        layer_features: list[torch.Tensor] = []
+
+        for i, layer in enumerate(transformer.layers):
+            unified = layer(unified, unified_attn_mask, unified_freqs, adaln_input)
+
+            # Store pre-temporal img_tokens for this layer
+            img_tokens = unified[:, :img_len].clone()  # (B, N, D)
+            layer_features.append(img_tokens)
+
+            # Apply temporal attention (no-op for single frame, but keeps state consistent)
+            # We skip temporal attention here since we're just collecting features
+
+        return layer_features
+
+    def _forward_cached(
+        self,
+        hidden_states: torch.Tensor,
+        timesteps: torch.Tensor,
+        action_cond: Optional[torch.Tensor],
+        spatial_cache: "SpatialFeatureCache",
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        """Cached streaming forward: only process new frame, use spatial cache.
+
+        Runs ONE frame through all Z-Image blocks. At each TemporalAttention
+        layer, concatenates cached context features with new frame's features
+        and applies causal temporal attention (new frame sees all context).
+
+        Args:
+            hidden_states: New noisy frame (B, C, H, W) — single frame only.
+            timesteps: Diffusion timesteps (B,).
+            action_cond: Action conditioning (B, 1, D) for the new frame, or None.
+            spatial_cache: Pre-populated cache with context frame features.
+            height: Latent height.
+            width: Latent width.
+
+        Returns:
+            Noise/velocity prediction for new frame (B, C, H, W).
+        """
+        from streaming.spatial_feature_cache import SpatialFeatureCache
+
+        transformer = self.transformer
+        batch_size = hidden_states.shape[0]
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        patch_size = 2
+        f_patch_size = 1
+
+        new_frame_global_idx = spatial_cache.next_frame_global_idx
+
+        # Timestep embedding
+        t_scaled = timesteps * transformer.t_scale
+        adaln_input = transformer.t_embedder(t_scaled)
+
+        # Prepare single-frame inputs
+        x_list = [img.unsqueeze(1) for img in hidden_states.unbind(0)]
+        cap_list = [
+            torch.zeros(1, ZIMAGE_CAP_FEAT_DIM, device=device, dtype=dtype)
+            for _ in range(batch_size)
+        ]
+
+        # Patchify and embed
+        (
+            x_patches, cap_feats,
+            x_size, x_pos_ids, cap_pos_ids,
+            x_inner_pad_mask, cap_inner_pad_mask,
+        ) = transformer.patchify_and_embed(x_list, cap_list, patch_size, f_patch_size)
+
+        x_item_seqlens = [len(p) for p in x_patches]
+        x_patches_cat = torch.cat(x_patches, dim=0)
+        x_patches_cat = transformer.all_x_embedder[f"{patch_size}-{f_patch_size}"](x_patches_cat)
+
+        adaln_input = adaln_input.type_as(x_patches_cat)
+        x_patches_cat[torch.cat(x_inner_pad_mask)] = transformer.x_pad_token
+        x_patches_split = list(x_patches_cat.split(x_item_seqlens, dim=0))
+        x_freqs_cis = list(
+            transformer.rope_embedder(torch.cat(x_pos_ids, dim=0))
+            .split([len(p) for p in x_pos_ids], dim=0)
+        )
+        x_padded = torch.stack(x_patches_split, dim=0)
+        x_freqs_padded = torch.stack(x_freqs_cis, dim=0)
+        x_max_seqlen = x_item_seqlens[0]
+        x_attn_mask = torch.ones((batch_size, x_max_seqlen), dtype=torch.bool, device=device)
+
+        # Noise refiner
+        for layer in transformer.noise_refiner:
+            x_padded = layer(x_padded, x_attn_mask, x_freqs_padded, adaln_input)
+
+        # Caption
+        cap_item_seqlens = [len(c) for c in cap_feats]
+        cap_feats_cat = torch.cat(cap_feats, dim=0)
+        cap_feats_cat = transformer.cap_embedder(cap_feats_cat)
+        cap_feats_cat[torch.cat(cap_inner_pad_mask)] = transformer.cap_pad_token
+        cap_feats_split = list(cap_feats_cat.split(cap_item_seqlens, dim=0))
+        cap_freqs_cis = list(
+            transformer.rope_embedder(torch.cat(cap_pos_ids, dim=0))
+            .split([len(p) for p in cap_pos_ids], dim=0)
+        )
+        cap_padded = torch.stack(cap_feats_split, dim=0)
+        cap_freqs_padded = torch.stack(cap_freqs_cis, dim=0)
+        cap_max_seqlen = cap_item_seqlens[0]
+        cap_attn_mask = torch.ones((batch_size, cap_max_seqlen), dtype=torch.bool, device=device)
+
+        for layer in transformer.context_refiner:
+            cap_padded = layer(cap_padded, cap_attn_mask, cap_freqs_padded)
+
+        # Unified stream
+        unified_list = []
+        unified_freqs_list = []
+        for i in range(batch_size):
+            xl = x_item_seqlens[i]
+            cl = cap_item_seqlens[i]
+            unified_list.append(torch.cat([x_padded[i, :xl], cap_padded[i, :cl]]))
+            unified_freqs_list.append(torch.cat([x_freqs_padded[i, :xl], cap_freqs_padded[i, :cl]]))
+
+        unified = torch.stack(unified_list, dim=0)
+        unified_freqs = torch.stack(unified_freqs_list, dim=0)
+        unified_attn_mask = torch.ones(
+            (batch_size, x_item_seqlens[0] + cap_item_seqlens[0]),
+            dtype=torch.bool, device=device,
+        )
+        img_len = x_item_seqlens[0]
+
+        # Main transformer blocks with cached temporal attention
+        for i, layer in enumerate(transformer.layers):
+            # Z-Image spatial block for new frame only
+            unified = layer(unified, unified_attn_mask, unified_freqs, adaln_input)
+
+            # Temporal attention using spatial cache
+            temporal_layer = self._temporal_layer_list[i]
+            if temporal_layer is not None:
+                img_tokens_new = unified[:, :img_len]  # (B, N, D)
+
+                # Get cached context features for this layer
+                context_feats = spatial_cache.get_context_feats(i)
+                if context_feats is not None:
+                    context_feats = context_feats.to(dtype=img_tokens_new.dtype)
+
+                # Apply temporal attention with context cache
+                img_tokens_new = temporal_layer.forward_with_context(
+                    img_tokens_new,
+                    context_feats,
+                    new_frame_global_idx=new_frame_global_idx,
+                )
+                unified = torch.cat([img_tokens_new.to(unified.dtype), unified[:, img_len:]], dim=1)
+
+            # Action injection for new frame
+            action_layer = self._action_injection_list[i]
+            if action_layer is not None and action_cond is not None:
+                img_tokens = unified[:, :img_len]
+                img_tokens = action_layer(img_tokens, action_cond)
+                unified = torch.cat([img_tokens.to(unified.dtype), unified[:, img_len:]], dim=1)
+
+        # Final layer + unpatchify
+        final_layer = transformer.all_final_layer[f"{patch_size}-{f_patch_size}"]
+        unified = final_layer(unified, adaln_input)
+
+        unified_split = list(unified.unbind(dim=0))
+        x_size_list = list(x_size) if isinstance(x_size, (list, tuple)) else x_size
+        output = transformer.unpatchify(unified_split, x_size_list, patch_size, f_patch_size)
+
+        output = torch.stack(output, dim=0)  # (B, C, 1, H, W)
+        output = output.squeeze(2)  # (B, C, H, W)
 
         return output
 
