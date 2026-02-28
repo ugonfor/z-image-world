@@ -94,10 +94,15 @@ class TemporalAttention(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        # QKV: small-gain xavier to avoid large activations at init
         nn.init.xavier_uniform_(self.to_q.weight, gain=0.01)
         nn.init.xavier_uniform_(self.to_k.weight, gain=0.01)
         nn.init.xavier_uniform_(self.to_v.weight, gain=0.01)
-        nn.init.zeros_(self.to_out.weight)
+        # to_out: xavier init (NOT zero) so gradient flows to gamma.
+        # gamma=0 preserves pretrained behavior at init; to_out needs non-zero
+        # weights so gamma receives a useful gradient signal (d_loss/d_gamma
+        # = d_loss/d_output * to_out(attn), which is 0 if to_out.weight=0).
+        nn.init.xavier_uniform_(self.to_out.weight, gain=0.01)
         nn.init.zeros_(self.to_out.bias)
         nn.init.normal_(self.frame_pos.weight, std=0.02)
 
