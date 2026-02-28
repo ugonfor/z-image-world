@@ -595,23 +595,62 @@ class CausalDiT(nn.Module):
         cls,
         pretrained_model_path: str,
         action_injection_layers: list[int] | None = None,
+        key_map: Optional[dict[str, str]] = None,
+        strict_spatial: bool = False,
+        verbose: bool = True,
         **kwargs,
     ) -> "CausalDiT":
         """Load from pretrained Z-Image checkpoint and add causal components.
 
+        Spatial attention weights are transferred from the checkpoint.
+        Temporal attention and action injection layers remain at zero-gamma
+        initialization and must be trained from scratch on video data.
+
         Args:
-            pretrained_model_path: Path to pretrained model
-            action_injection_layers: Layers for action injection
-            **kwargs: Additional model arguments
+            pretrained_model_path: Path to .safetensors or .pt checkpoint.
+            action_injection_layers: Layers for action injection. Default: [7, 14, 21].
+            key_map: Custom {pretrained_key: causal_dit_key} mapping. ``None``
+                     uses the default Z-Image-Turbo mapping.
+            strict_spatial: If ``True``, raise :exc:`RuntimeError` when any
+                            spatial key is absent from the checkpoint.
+            verbose: If ``True``, log a transfer summary via ``logging``.
+            **kwargs: Additional CausalDiT constructor arguments.
 
         Returns:
-            Initialized CausalDiT model
-        """
-        # This would load weights from Z-Image and initialize temporal layers
-        # For now, just create the model
-        model = cls(action_injection_layers=action_injection_layers, **kwargs)
+            CausalDiT with pretrained spatial weights loaded.
 
-        # TODO: Load pretrained weights and initialize temporal layers
-        # using Vid2World weight transfer method
+        Raises:
+            FileNotFoundError: If *pretrained_model_path* does not exist.
+            RuntimeError: If ``strict_spatial=True`` and spatial keys are missing.
+        """
+        import logging as _logging
+        from .weight_transfer import WeightTransfer
+
+        _logger = _logging.getLogger(__name__)
+
+        model = cls(action_injection_layers=action_injection_layers, **kwargs)
+        transfer = WeightTransfer(num_layers=model.num_layers, key_map=key_map)
+        report = transfer.load(model, pretrained_model_path)
+
+        if verbose:
+            _logger.info(
+                f"Loaded {len(report.loaded)} spatial weights "
+                f"from {pretrained_model_path}"
+            )
+            _logger.info(
+                f"New temporal/action layers (zero-init, train from scratch): "
+                f"{len(report.new_layers)}"
+            )
+            if report.missing:
+                _logger.warning(
+                    f"{len(report.missing)} spatial keys missing from checkpoint: "
+                    f"{report.missing}"
+                )
+
+        if strict_spatial and report.missing:
+            raise RuntimeError(
+                f"strict_spatial=True but {len(report.missing)} spatial keys are "
+                f"missing from the checkpoint: {report.missing}"
+            )
 
         return model
