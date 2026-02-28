@@ -133,37 +133,34 @@ class ActionConditioningLoss(nn.Module):
         actions: torch.Tensor,
         action_embeddings: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute action consistency loss.
+        """Compute action embedding distinctiveness loss.
 
-        Encourages the model output to be more similar when actions are the same
-        and different when actions are different.
+        Encourages action embeddings to be more distinct for different actions.
+        This is a proxy for action responsiveness that operates in embedding
+        space rather than output space (which would require full inference).
+
+        Note: A proper action consistency loss would require running inference
+        twice with different actions and comparing decoded outputs. That is
+        computed offline in scripts/evaluate.py instead.
         """
-        batch_size = model_output.shape[0]
+        batch_size = action_embeddings.shape[0]
         if batch_size < 2:
-            return torch.tensor(0.0, device=model_output.device)
+            return torch.tensor(0.0, device=action_embeddings.device)
 
-        # Flatten spatial dimensions for comparison
-        output_flat = model_output.flatten(2).mean(dim=-1)  # (B, F)
+        # action_embeddings: (B, F, D) - use first frame embedding
+        emb = action_embeddings[:, 0]  # (B, D)
+        emb_norm = F.normalize(emb, dim=-1)
 
-        # Compute pairwise similarities in output space
-        output_sim = F.cosine_similarity(
-            output_flat.unsqueeze(1),
-            output_flat.unsqueeze(0),
-            dim=-1,
-        )  # (B, B)
+        # Pairwise cosine similarity
+        sim = emb_norm @ emb_norm.T  # (B, B)
 
-        # Compute action similarities
-        # Same action = 1, different action = 0
-        actions_expanded = actions[:, 0]  # Use first frame action
-        action_match = (
-            actions_expanded.unsqueeze(1) == actions_expanded.unsqueeze(0)
-        ).float()
+        # Action match matrix
+        actions_first = actions[:, 0]
+        match = (actions_first.unsqueeze(1) == actions_first.unsqueeze(0)).float()
 
-        # Loss: output similarity should match action similarity
-        # (same actions -> similar outputs, different actions -> different outputs)
-        consistency_loss = F.mse_loss(output_sim, action_match)
-
-        return consistency_loss
+        # Same actions should have similar embeddings, different actions different
+        loss = F.mse_loss(sim, match)
+        return loss
 
 
 class ActionFinetuner:
@@ -202,6 +199,13 @@ class ActionFinetuner:
         self.loss_fn = ActionConditioningLoss(
             prediction_type=config.prediction_type
         )
+
+        # Precompute noise schedule (fixed, no need to recompute each step)
+        betas = torch.linspace(0.0001, 0.02, config.num_train_timesteps, device=device)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.register_buffer = lambda name, tensor: setattr(self, name, tensor)
+        self.alphas_cumprod = alphas_cumprod
 
         # Optimizer (only LoRA params + action encoder)
         self.optimizer = self._create_optimizer()
@@ -378,19 +382,9 @@ class ActionFinetuner:
         noise: torch.Tensor,
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
-        """Add noise to latents."""
-        # Compute alpha values
-        betas = torch.linspace(0.0001, 0.02, self.config.num_train_timesteps, device=self.device)
-        alphas = 1.0 - betas
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
-
-        sqrt_alpha = torch.sqrt(alphas_cumprod[timesteps])
-        sqrt_one_minus_alpha = torch.sqrt(1 - alphas_cumprod[timesteps])
-
-        # Reshape for broadcasting
-        sqrt_alpha = sqrt_alpha[:, None, None, None, None]
-        sqrt_one_minus_alpha = sqrt_one_minus_alpha[:, None, None, None, None]
-
+        """Add noise to latents using precomputed schedule."""
+        sqrt_alpha = torch.sqrt(self.alphas_cumprod[timesteps])[:, None, None, None, None]
+        sqrt_one_minus_alpha = torch.sqrt(1 - self.alphas_cumprod[timesteps])[:, None, None, None, None]
         return sqrt_alpha * latents + sqrt_one_minus_alpha * noise
 
     def _get_velocity(
@@ -399,14 +393,9 @@ class ActionFinetuner:
         noise: torch.Tensor,
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute velocity target."""
-        betas = torch.linspace(0.0001, 0.02, self.config.num_train_timesteps, device=self.device)
-        alphas = 1.0 - betas
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
-
-        sqrt_alpha = torch.sqrt(alphas_cumprod[timesteps])[:, None, None, None, None]
-        sqrt_one_minus_alpha = torch.sqrt(1 - alphas_cumprod[timesteps])[:, None, None, None, None]
-
+        """Compute DDPM v-prediction target using precomputed schedule."""
+        sqrt_alpha = torch.sqrt(self.alphas_cumprod[timesteps])[:, None, None, None, None]
+        sqrt_one_minus_alpha = torch.sqrt(1 - self.alphas_cumprod[timesteps])[:, None, None, None, None]
         return sqrt_alpha * noise - sqrt_one_minus_alpha * latents
 
     def train_epoch(

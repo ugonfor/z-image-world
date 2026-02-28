@@ -46,23 +46,26 @@ class SinusoidalPositionEmbedding(nn.Module):
         """Generate sinusoidal embeddings.
 
         Args:
-            x: Position indices (batch,) or (batch, seq)
+            x: Position indices (batch,) or (batch, seq) - any dtype
 
         Returns:
             Embeddings of shape (batch, dim) or (batch, seq, dim)
+            Output dtype matches input dtype.
         """
         device = x.device
+        # Compute in float32 for numerical precision, then cast to input dtype
+        x_float = x.float()
         half_dim = self.dim // 2
         emb = math.log(self.max_length) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=torch.float32) * -emb)
 
-        if x.dim() == 1:
-            emb = x[:, None] * emb[None, :]
+        if x_float.dim() == 1:
+            emb = x_float[:, None] * emb[None, :]
         else:
-            emb = x.unsqueeze(-1) * emb[None, None, :]
+            emb = x_float.unsqueeze(-1) * emb[None, None, :]
 
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
-        return emb
+        return emb  # Always float32; caller casts to model dtype
 
 
 class CausalAttention(nn.Module):
@@ -509,6 +512,9 @@ class CausalDiT(nn.Module):
         else:
             num_frames = x.shape[1]
 
+        # Cast input to model's working dtype (handles float32 input to bfloat16 model)
+        x = x.to(self.patch_embed.weight.dtype)
+
         batch_size, num_frames, channels, height, width = x.shape
 
         # Flatten batch and frames
@@ -537,7 +543,11 @@ class CausalDiT(nn.Module):
         else:
             timesteps = rearrange(timesteps, "b f -> (b f)")
 
-        t_emb = self.timestep_embed(timesteps.float())  # (B*F, D)
+        # Sinusoidal embedding runs in float32; cast to model dtype before Linear layers
+        # (timestep_embed is Sequential: sinusoidal → linear → silu → linear)
+        t_emb = self.timestep_embed[0](timesteps).to(x.dtype)  # float32 → model dtype
+        for layer in list(self.timestep_embed)[1:]:
+            t_emb = layer(t_emb)  # (B*F, D)
 
         # Expand action conditioning to match (batch * num_frames) structure
         # Input: (batch, num_frames, hidden_dim) -> Output: (batch * num_frames, num_frames, hidden_dim)

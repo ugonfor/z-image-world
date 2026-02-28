@@ -178,7 +178,7 @@ class RealtimePipeline:
         """Setup noise scheduler for inference."""
         num_steps = self.config.num_inference_steps
 
-        # Linear timestep schedule
+        # Linear timestep schedule from high to low noise
         self.timesteps = torch.linspace(
             999, 0, num_steps, device=self.device
         ).long()
@@ -187,6 +187,14 @@ class RealtimePipeline:
         betas = torch.linspace(0.0001, 0.02, 1000, device=self.device)
         alphas = 1.0 - betas
         self.alphas_cumprod = torch.cumprod(alphas, dim=0)
+
+        # Precompute previous timestep mapping for correct DDIM steps
+        # timesteps[i] -> timesteps[i+1] (next step is lower noise)
+        t_prev = torch.zeros(1000, dtype=torch.long, device=self.device)
+        for idx, t in enumerate(self.timesteps):
+            t_next = self.timesteps[idx + 1] if idx + 1 < len(self.timesteps) else torch.tensor(0, device=self.device)
+            t_prev[t] = t_next
+        self._t_prev_map = t_prev
 
     @classmethod
     def from_pretrained(
@@ -383,9 +391,10 @@ class RealtimePipeline:
         )
         noise_pred = noise_pred.squeeze(1)  # Remove frame dimension
 
-        # Simple DDPM step
+        # DDIM step: use the correct previous timestep from the schedule
         alpha = self.alphas_cumprod[t]
-        alpha_prev = self.alphas_cumprod[max(t - 1000 // self.config.num_inference_steps, 0)]
+        t_prev = self._t_prev_map[t]
+        alpha_prev = self.alphas_cumprod[t_prev]
 
         # Predict x0
         sqrt_alpha = torch.sqrt(alpha)

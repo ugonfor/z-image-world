@@ -139,10 +139,14 @@ class TemporalAttention(nn.Module):
         return x + self.gamma * out
 
 
-class ActionInjectionLayer(nn.Module):
+class ZImageActionInjectionLayer(nn.Module):
     """Cross-attention for injecting action conditioning into Z-Image hidden states.
 
+    Uses RMSNorm and sigmoid gating to match Z-Image's architecture style.
     Zero-initialized gate so the model starts without action influence.
+
+    Note: This is the Z-Image-specific implementation (3840-dim, RMSNorm).
+    For CausalDiT, use models.action_encoder.ActionInjectionLayer instead.
     """
 
     def __init__(
@@ -207,10 +211,13 @@ class ActionInjectionLayer(nn.Module):
         return x + torch.sigmoid(self.gate) * out
 
 
-class ActionEncoder(nn.Module):
+class ZImageActionEncoder(nn.Module):
     """Encodes discrete actions for Z-Image world model conditioning.
 
-    Projects 17 discrete actions into Z-Image's hidden space (3840-dim).
+    Projects 17 discrete actions into Z-Image's hidden space (3840-dim, RMSNorm).
+
+    Note: This is the Z-Image-specific implementation (3840-dim, RMSNorm).
+    For CausalDiT, use models.action_encoder.ActionEncoder instead (4096-dim, LayerNorm).
     """
 
     def __init__(
@@ -333,18 +340,26 @@ class ZImageWorldModel(nn.Module):
             )
             for i in self.temporal_layer_indices
         })
+        # Build list for compile-friendly indexed access (avoids dict lookup graph breaks)
+        self._temporal_layer_list = [
+            self.temporal_layers.get(str(i)) for i in range(num_layers)
+        ]
 
         # Action injection layers (at specified depths)
         self.action_injections = nn.ModuleDict({
-            str(i): ActionInjectionLayer(
+            str(i): ZImageActionInjectionLayer(
                 hidden_dim=hidden_dim,
                 num_heads=num_heads,
             )
             for i in action_injection_layers
         })
+        # Build list for compile-friendly indexed access
+        self._action_injection_list = [
+            self.action_injections.get(str(i)) for i in range(num_layers)
+        ]
 
         # Action encoder
-        self.action_encoder = ActionEncoder(
+        self.action_encoder = ZImageActionEncoder(
             hidden_dim=hidden_dim,
             max_frames=max_frames,
         )
@@ -535,8 +550,10 @@ class ZImageWorldModel(nn.Module):
         4. Concatenate into unified stream [image | caption]
         5. Main transformer blocks on unified stream
         6. Final layer + unpatchify
+
+        Note: All frames in a batch must have the same spatial resolution.
+        This allows torch.stack instead of pad_sequence (no graph breaks).
         """
-        from torch.nn.utils.rnn import pad_sequence
 
         transformer = self.transformer
         bf = hidden_states.shape[0]  # batch_size * num_frames
@@ -578,14 +595,14 @@ class ZImageWorldModel(nn.Module):
             .split([len(p) for p in x_pos_ids], dim=0)
         )
 
-        x_padded = pad_sequence(x_patches_split, batch_first=True, padding_value=0.0)
-        x_freqs_padded = pad_sequence(x_freqs_cis, batch_first=True, padding_value=0.0)
-        x_freqs_padded = x_freqs_padded[:, :x_padded.shape[1]]
+        # All frames must have same spatial size (asserted below), so use stack
+        # instead of pad_sequence to avoid torch.compile graph breaks
+        x_padded = torch.stack(x_patches_split, dim=0)
+        x_freqs_padded = torch.stack(x_freqs_cis, dim=0)
 
-        x_max_seqlen = max(x_item_seqlens)
-        x_attn_mask = torch.zeros((bf, x_max_seqlen), dtype=torch.bool, device=device)
-        for i, sl in enumerate(x_item_seqlens):
-            x_attn_mask[i, :sl] = 1
+        x_max_seqlen = x_item_seqlens[0]
+        # All tokens are valid (no padding needed since all frames same size)
+        x_attn_mask = torch.ones((bf, x_max_seqlen), dtype=torch.bool, device=device)
 
         # --- Noise refiner ---
         for layer in transformer.noise_refiner:
@@ -602,14 +619,12 @@ class ZImageWorldModel(nn.Module):
             .split([len(p) for p in cap_pos_ids], dim=0)
         )
 
-        cap_padded = pad_sequence(cap_feats_split, batch_first=True, padding_value=0.0)
-        cap_freqs_padded = pad_sequence(cap_freqs_cis, batch_first=True, padding_value=0.0)
-        cap_freqs_padded = cap_freqs_padded[:, :cap_padded.shape[1]]
+        # Null captions all have length 1, so stack directly
+        cap_padded = torch.stack(cap_feats_split, dim=0)
+        cap_freqs_padded = torch.stack(cap_freqs_cis, dim=0)
 
-        cap_max_seqlen = max(cap_item_seqlens)
-        cap_attn_mask = torch.zeros((bf, cap_max_seqlen), dtype=torch.bool, device=device)
-        for i, sl in enumerate(cap_item_seqlens):
-            cap_attn_mask[i, :sl] = 1
+        cap_max_seqlen = cap_item_seqlens[0]
+        cap_attn_mask = torch.ones((bf, cap_max_seqlen), dtype=torch.bool, device=device)
 
         for layer in transformer.context_refiner:
             cap_padded = layer(cap_padded, cap_attn_mask, cap_freqs_padded)
@@ -624,14 +639,12 @@ class ZImageWorldModel(nn.Module):
             unified_list.append(torch.cat([x_padded[i, :xl], cap_padded[i, :cl]]))
             unified_freqs_list.append(torch.cat([x_freqs_padded[i, :xl], cap_freqs_padded[i, :cl]]))
 
-        unified_seqlens = [x_item_seqlens[i] + cap_item_seqlens[i] for i in range(bf)]
-        unified_max_seqlen = max(unified_seqlens)
+        # All frames same x_len + same cap_len = same unified_len → stack directly
+        unified_max_seqlen = x_item_seqlens[0] + cap_item_seqlens[0]
 
-        unified = pad_sequence(unified_list, batch_first=True, padding_value=0.0)
-        unified_freqs = pad_sequence(unified_freqs_list, batch_first=True, padding_value=0.0)
-        unified_attn_mask = torch.zeros((bf, unified_max_seqlen), dtype=torch.bool, device=device)
-        for i, sl in enumerate(unified_seqlens):
-            unified_attn_mask[i, :sl] = 1
+        unified = torch.stack(unified_list, dim=0)
+        unified_freqs = torch.stack(unified_freqs_list, dim=0)
+        unified_attn_mask = torch.ones((bf, unified_max_seqlen), dtype=torch.bool, device=device)
 
         # Image token count (same for all frames since same spatial size)
         # Assert all frames have the same number of image tokens
@@ -646,25 +659,29 @@ class ZImageWorldModel(nn.Module):
             unified = layer(unified, unified_attn_mask, unified_freqs, adaln_input)
 
             # Temporal attention (only on image tokens, at configured layers)
-            if num_frames > 1 and str(i) in self.temporal_layers:
+            # Use list indexing instead of dict lookup to avoid torch.compile graph breaks
+            temporal_layer = self._temporal_layer_list[i]
+            if num_frames > 1 and temporal_layer is not None:
                 img_tokens = unified[:, :img_len]  # (B*F, img_len, D)
                 if getattr(self, "_use_gradient_checkpointing", False) and self.training:
                     img_tokens = torch.utils.checkpoint.checkpoint(
-                        self.temporal_layers[str(i)], img_tokens, num_frames,
+                        temporal_layer, img_tokens, num_frames,
                         use_reentrant=False,
                     )
                 else:
-                    img_tokens = self.temporal_layers[str(i)](img_tokens, num_frames)
+                    img_tokens = temporal_layer(img_tokens, num_frames)
                 unified = torch.cat([img_tokens.to(unified.dtype), unified[:, img_len:]], dim=1)
 
             # Action injection (per-frame: each frame sees only its own action)
-            if str(i) in self.action_injections and action_cond is not None:
+            # Use list indexing for compile-friendliness
+            action_layer = self._action_injection_list[i]
+            if action_layer is not None and action_cond is not None:
                 img_tokens = unified[:, :img_len]
                 # action_cond is (B, F, D). Reshape to (B*F, 1, D) so each
                 # frame's image tokens cross-attend to only its own action.
                 # This prevents future action leakage.
                 action_per_frame = rearrange(action_cond, "b f d -> (b f) 1 d")
-                img_tokens = self.action_injections[str(i)](img_tokens, action_per_frame)
+                img_tokens = action_layer(img_tokens, action_per_frame)
                 unified = torch.cat([img_tokens.to(unified.dtype), unified[:, img_len:]], dim=1)
 
         # --- Final layer ---
