@@ -8,12 +8,14 @@ dependencies = [
     "torchvision>=0.15.0",
     "accelerate>=1.0.0",
     "transformers>=4.45.0",
+    "diffusers @ git+https://github.com/huggingface/diffusers.git",
     "safetensors>=0.4.0",
     "einops>=0.8.0",
     "omegaconf>=2.3.0",
     "pyyaml>=6.0",
     "numpy>=1.26.0",
     "tqdm>=4.66.0",
+    "pillow>=10.0.0",
 ]
 
 [project.optional-dependencies]
@@ -59,6 +61,9 @@ explicit = true
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["models", "streaming", "training", "inference", "data", "demo"]

@@ -249,7 +249,11 @@ class SimpleVideoDataset(Dataset):
 
 
 class SimpleCausalDiT(nn.Module):
-    """Simplified CausalDiT for faster training on small datasets."""
+    """Simplified CausalDiT for next-frame prediction.
+
+    Conditioned on the current frame via channel-wise concatenation:
+    input = [noisy_next_frame | current_frame] along channel dim.
+    """
 
     def __init__(
         self,
@@ -265,9 +269,9 @@ class SimpleCausalDiT(nn.Module):
         self.hidden_dim = hidden_dim
         self.patch_size = patch_size
 
-        # Patch embedding
+        # Patch embedding: takes 2x channels (noisy target + condition frame)
         self.patch_embed = nn.Conv2d(
-            in_channels, hidden_dim,
+            in_channels * 2, hidden_dim,
             kernel_size=patch_size, stride=patch_size
         )
 
@@ -294,7 +298,7 @@ class SimpleCausalDiT(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # Output projection
+        # Output projection (only predicts noise for the target channels)
         self.norm = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, patch_size * patch_size * in_channels)
 
@@ -313,46 +317,53 @@ class SimpleCausalDiT(nn.Module):
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
         return emb
 
-    def forward(self, x, timesteps):
+    def forward(self, x, timesteps, cond=None):
         """
         Args:
-            x: (B, C, H, W) noisy latents
+            x: (B, C, H, W) noisy latents of the target frame
             timesteps: (B,) diffusion timesteps
+            cond: (B, C, H, W) clean latents of the conditioning frame.
+                  If None, uses zeros (unconditional).
 
         Returns:
             noise_pred: (B, C, H, W) predicted noise
         """
         B, C, H, W = x.shape
 
+        # Concatenate condition along channel dim
+        if cond is None:
+            cond = torch.zeros_like(x)
+        x_in = torch.cat([x, cond], dim=1)  # (B, 2*C, H, W)
+
         # Patch embed
-        x = self.patch_embed(x)  # (B, D, H/P, W/P)
-        h, w = x.shape[2], x.shape[3]
-        x = rearrange(x, 'b d h w -> b (h w) d')
+        x_in = self.patch_embed(x_in)  # (B, D, H/P, W/P)
+        h, w = x_in.shape[2], x_in.shape[3]
+        x_in = rearrange(x_in, 'b d h w -> b (h w) d')
 
         # Add position embedding
-        seq_len = x.shape[1]
-        x = x + self.pos_embed[:, :seq_len]
+        seq_len = x_in.shape[1]
+        x_in = x_in + self.pos_embed[:, :seq_len]
 
         # Add timestep embedding
         t_emb = self._get_timestep_embedding(timesteps, self.hidden_dim)
         t_emb = self.time_embed(t_emb)  # (B, D)
-        x = x + t_emb.unsqueeze(1)
+        x_in = x_in + t_emb.unsqueeze(1)
 
         # Transformer layers
         for layer in self.layers:
-            x = layer(x)
+            x_in = layer(x_in)
 
         # Output
-        x = self.norm(x)
-        x = self.out_proj(x)  # (B, seq_len, P*P*C)
+        x_in = self.norm(x_in)
+        x_in = self.out_proj(x_in)  # (B, seq_len, P*P*C)
 
         # Unpatchify
-        x = rearrange(
-            x, 'b (h w) (p1 p2 c) -> b c (h p1) (w p2)',
+        x_in = rearrange(
+            x_in, 'b (h w) (p1 p2 c) -> b c (h p1) (w p2)',
             h=h, w=w, p1=self.patch_size, p2=self.patch_size, c=C
         )
 
-        return x
+        return x_in
 
 
 class SimpleVAE(nn.Module):
@@ -472,6 +483,7 @@ def train_diffusion(
     print("\n=== Training Diffusion Model ===")
 
     optimizer = torch.optim.AdamW(dit.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=lr * 0.01)
 
     # Noise schedule
     betas = torch.linspace(0.0001, 0.02, num_timesteps, device=device)
@@ -497,11 +509,16 @@ def train_diffusion(
                 latents, _, _ = vae.encode(frames_flat)
                 latents = rearrange(latents, '(b f) c h w -> b f c h w', b=batch_size, f=num_frames)
 
-            # For each frame pair, predict next frame
+            # For each frame pair, predict next frame conditioned on current frame
             losses = []
             for frame_idx in range(num_frames - 1):
                 current_latent = latents[:, frame_idx]  # (B, C, h, w)
                 target_latent = latents[:, frame_idx + 1]  # (B, C, h, w)
+
+                # Light noise augmentation on condition (helps inference robustness)
+                if torch.rand(1).item() < 0.1:
+                    cond_noise_scale = 0.05 * torch.rand(1, device=device).item()
+                    current_latent = current_latent + cond_noise_scale * torch.randn_like(current_latent)
 
                 # Sample timesteps
                 t = torch.randint(0, num_timesteps, (batch_size,), device=device)
@@ -512,10 +529,8 @@ def train_diffusion(
                 sqrt_one_minus_alpha = sqrt_one_minus_alphas_cumprod[t].view(batch_size, 1, 1, 1)
                 noisy_target = sqrt_alpha * target_latent + sqrt_one_minus_alpha * noise
 
-                # Concatenate current frame as condition (channel-wise)
-                # For simplicity, we'll just predict noise from noisy target
-                # In full implementation, we'd condition on current frame
-                noise_pred = dit(noisy_target, t)
+                # Predict noise conditioned on current frame
+                noise_pred = dit(noisy_target, t, cond=current_latent)
 
                 # MSE loss
                 loss = torch.nn.functional.mse_loss(noise_pred, noise)
@@ -533,8 +548,10 @@ def train_diffusion(
             total_loss += loss.item()
             num_batches += 1
 
+        scheduler.step()
         avg_loss = total_loss / num_batches
-        print(f"  Epoch {epoch+1}/{num_epochs}: loss={avg_loss:.4f}")
+        lr_now = scheduler.get_last_lr()[0]
+        print(f"  Epoch {epoch+1}/{num_epochs}: loss={avg_loss:.4f}, lr={lr_now:.2e}")
 
     return dit
 
@@ -579,12 +596,12 @@ def generate_frames(
         # Start from noise
         latent = torch.randn_like(current_latent)
 
-        # Denoise
+        # Denoise, conditioned on current frame
         for i, t in enumerate(timesteps):
             t_tensor = torch.tensor([t], device=device)
 
-            # Predict noise
-            noise_pred = dit(latent, t_tensor)
+            # Predict noise conditioned on current frame
+            noise_pred = dit(latent, t_tensor, cond=current_latent)
 
             # DDPM step
             alpha = alphas_cumprod[t]
@@ -604,12 +621,12 @@ def generate_frames(
             else:
                 latent = x0_pred
 
-        # Decode
+        # Decode for visualization
         frame = vae.decode(latent)
         generated_frames.append(frame.cpu())
 
-        # Update current latent
-        current_latent = latent
+        # Stay in latent space for next frame's condition (avoid VAE roundtrip error)
+        current_latent = latent.detach()
 
     return generated_frames
 
@@ -658,11 +675,12 @@ def main():
     parser.add_argument("--quick", action="store_true", help="Quick test with minimal training")
     parser.add_argument("--num_videos", type=int, default=10, help="Number of videos to use")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
-    parser.add_argument("--vae_epochs", type=int, default=10, help="VAE training epochs")
-    parser.add_argument("--dit_epochs", type=int, default=20, help="DiT training epochs")
+    parser.add_argument("--vae_epochs", type=int, default=50, help="VAE training epochs")
+    parser.add_argument("--dit_epochs", type=int, default=200, help="DiT training epochs")
     parser.add_argument("--resolution", type=int, default=256, help="Image resolution")
     parser.add_argument("--num_frames", type=int, default=8, help="Frames per sample")
     parser.add_argument("--generate_frames", type=int, default=10, help="Frames to generate")
+    parser.add_argument("--samples_per_video", type=int, default=5, help="Training samples per video")
     args = parser.parse_args()
 
     # Quick mode overrides
@@ -701,7 +719,7 @@ def main():
         video_paths=video_paths,
         num_frames=args.num_frames,
         resolution=(args.resolution, args.resolution),
-        samples_per_video=5,
+        samples_per_video=args.samples_per_video,
     )
 
     dataloader = DataLoader(
