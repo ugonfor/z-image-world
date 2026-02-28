@@ -290,3 +290,85 @@ class TestTemporalAttentionWithContext:
         # global idx > max_frames (16) should not crash
         out = temporal_attn.forward_with_context(x_new, context_feats, new_frame_global_idx=50)
         assert out.shape == x_new.shape
+
+
+class TestSpatialCacheLifecycle:
+    """Integration tests for SpatialFeatureCache lifecycle matching pipeline behavior."""
+
+    NUM_LAYERS = 4
+    B, N, D = 1, 8, 32
+
+    def _make_layer_feats(self, seed=None):
+        if seed is not None:
+            torch.manual_seed(seed)
+        return [torch.randn(self.B, self.N, self.D) for _ in range(self.NUM_LAYERS)]
+
+    def test_cache_advances_after_each_frame(self):
+        """next_frame_global_idx increments correctly as frames are added."""
+        cache = SpatialFeatureCache(num_layers=self.NUM_LAYERS, max_context_frames=4)
+        assert cache.next_frame_global_idx == 0
+
+        for i in range(5):
+            cache.add_frame(self._make_layer_feats(seed=i))
+            assert cache.next_frame_global_idx == i + 1
+
+    def test_context_frames_count_caps_at_max(self):
+        """num_context_frames never exceeds max_context_frames."""
+        max_ctx = 3
+        cache = SpatialFeatureCache(num_layers=self.NUM_LAYERS, max_context_frames=max_ctx)
+
+        for i in range(6):
+            cache.add_frame(self._make_layer_feats(seed=i))
+            assert cache.num_context_frames <= max_ctx
+
+    def test_get_context_feats_shape_after_eviction(self):
+        """After eviction, get_context_feats still returns max_context frames."""
+        max_ctx = 2
+        cache = SpatialFeatureCache(num_layers=self.NUM_LAYERS, max_context_frames=max_ctx)
+
+        for i in range(5):
+            cache.add_frame(self._make_layer_feats(seed=i))
+
+        ctx = cache.get_context_feats(0)
+        assert ctx.shape == (self.B, max_ctx, self.N, self.D)
+
+    def test_oldest_frame_global_idx_advances_on_eviction(self):
+        """oldest_frame_global_idx advances as frames are evicted."""
+        max_ctx = 2
+        cache = SpatialFeatureCache(num_layers=self.NUM_LAYERS, max_context_frames=max_ctx)
+
+        for i in range(5):
+            cache.add_frame(self._make_layer_feats(seed=i))
+
+        # After 5 frames with max 2: oldest = 5 - 2 = 3
+        assert cache.oldest_frame_global_idx == 3
+        assert cache.next_frame_global_idx == 5
+
+    def test_position_formula_consistent(self):
+        """Position indices computed in forward_with_context match cache state."""
+        max_ctx = 3
+        cache = SpatialFeatureCache(num_layers=self.NUM_LAYERS, max_context_frames=max_ctx)
+
+        for i in range(4):  # Add 4 frames, cache holds 3
+            cache.add_frame(self._make_layer_feats(seed=i))
+
+        T = cache.num_context_frames
+        new_idx = cache.next_frame_global_idx
+        start_idx = new_idx - T  # Formula from forward_with_context
+        expected_context_indices = list(range(start_idx, new_idx))
+
+        assert expected_context_indices == cache.context_global_indices()
+
+    def test_reset_restores_initial_state(self):
+        """After reset, cache behaves identically to a fresh instance."""
+        cache = SpatialFeatureCache(num_layers=self.NUM_LAYERS, max_context_frames=3)
+        for i in range(5):
+            cache.add_frame(self._make_layer_feats(seed=i))
+
+        cache.reset()
+
+        assert cache.next_frame_global_idx == 0
+        assert cache.num_context_frames == 0
+        assert not cache.is_populated
+        for layer_i in range(self.NUM_LAYERS):
+            assert cache.get_context_feats(layer_i) is None
