@@ -568,6 +568,7 @@ class ZImageWorldModel(nn.Module):
         latents: torch.Tensor,
         timesteps: torch.Tensor,
         actions: Optional[torch.Tensor] = None,
+        cap_feat_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass for diffusion denoising.
 
@@ -579,6 +580,9 @@ class ZImageWorldModel(nn.Module):
             latents: Noisy latents (batch, num_frames, 16, H//8, W//8)
             timesteps: Diffusion timesteps (batch,) or (batch, num_frames)
             actions: Action indices (batch, num_frames), optional
+            cap_feat_override: Pre-computed caption features (seq_len, cap_feat_dim).
+                If provided, these are used for text conditioning instead of null captions.
+                Compute once via ZImagePipeline.encode_prompt() and reuse across steps.
 
         Returns:
             Predicted noise (same shape as latents)
@@ -611,6 +615,7 @@ class ZImageWorldModel(nn.Module):
             action_cond=action_cond,
             height=height,
             width=width,
+            cap_feat_override=cap_feat_override,
         )
 
         # Reshape back
@@ -630,6 +635,7 @@ class ZImageWorldModel(nn.Module):
         action_cond: Optional[torch.Tensor],
         height: int,
         width: int,
+        cap_feat_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run Z-Image transformer with temporal attention injected after each block.
 
@@ -662,15 +668,21 @@ class ZImageWorldModel(nn.Module):
         # Each frame is one item in the list
         # Z-Image expects (C, F, H, W) per item where F=1 for images
         x_list = [img.unsqueeze(1) for img in hidden_states.unbind(0)]  # List of (C, 1, H, W)
-        # Null caption: zero-vector(s) per frame.
-        # cap length must be a multiple of SEQ_MULTI_OF=32 to avoid RoPE position ID mismatch
-        # in patchify_and_embed (non-multiple lengths cause incorrect pos_id generation).
         cap_feat_dim = getattr(transformer.config, "cap_feat_dim", ZIMAGE_CAP_FEAT_DIM)
-        _SEQ_MULTI_OF = 32  # matches diffusers SEQ_MULTI_OF constant
-        cap_list = [
-            torch.zeros(_SEQ_MULTI_OF, cap_feat_dim, device=device, dtype=hidden_states.dtype)
-            for _ in range(bf)
-        ]
+        if cap_feat_override is not None:
+            # Use real text caption features (from ZImagePipeline.encode_prompt).
+            # Same caption shared across all frames in the sequence.
+            cap_item = cap_feat_override.to(device=device, dtype=hidden_states.dtype)
+            cap_list = [cap_item for _ in range(bf)]
+        else:
+            # Null caption: zero-vector(s) per frame.
+            # cap length must be a multiple of SEQ_MULTI_OF=32 to avoid RoPE position ID
+            # mismatch in patchify_and_embed (non-multiple lengths cause incorrect pos_id).
+            _SEQ_MULTI_OF = 32  # matches diffusers SEQ_MULTI_OF constant
+            cap_list = [
+                torch.zeros(_SEQ_MULTI_OF, cap_feat_dim, device=device, dtype=hidden_states.dtype)
+                for _ in range(bf)
+            ]
 
         # --- Patchify and embed (reuse transformer's method) ---
         (
@@ -715,8 +727,12 @@ class ZImageWorldModel(nn.Module):
             transformer.rope_embedder(torch.cat(cap_pos_ids, dim=0))
             .split([len(p) for p in cap_pos_ids], dim=0)
         )
+        # cap_pos_ids can be longer than cap_feats: _pad_with_ids creates ori_pos_ids
+        # of size pos_grid_size (= total_padded_len) THEN appends pad_len zero positions,
+        # giving pos_ids_len = total_padded_len + pad_len > total_padded_len = feats_len.
+        # The official _prepare_sequence truncates with [:, :feats.shape[1]]. Do the same.
+        cap_freqs_cis = [f[:s] for f, s in zip(cap_freqs_cis, cap_item_seqlens)]
 
-        # Null captions all have length 1, so stack directly
         cap_padded = torch.stack(cap_feats_split, dim=0)
         cap_freqs_padded = torch.stack(cap_freqs_cis, dim=0)
 
