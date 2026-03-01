@@ -55,9 +55,15 @@ class FIFOConfig:
     seed_steps: int = 6           # Steps for seed image generation
     temporal_every_n: int = 3     # Temporal attention frequency (match training)
     # Anchor init: initialize new tail frames from the most recent clean (head) frame
-    # plus full noise, rather than pure random noise. This dramatically improves
-    # temporal coherence after the initial queue fills. Recommended: True.
+    # plus noise, rather than pure random noise. Dramatically improves temporal
+    # coherence after the initial queue fills. Recommended: True.
     anchor_init: bool = True
+    # Fraction of σ_max to add as noise when anchor_init=True.
+    # 1.0 = full noise (start from scratch each frame, high creativity, more drift)
+    # 0.7 = 70% noise (biases new frame toward previous, less drift, less motion)
+    # 0.5 = 50% noise (very close to previous frame, near-static video)
+    # Recommended range: 0.6–0.85 for balanced coherence vs. motion.
+    anchor_noise_frac: float = 0.75
     # Lookahead: freeze the front fraction as committed context (FIFO paper variant).
     # Requires front frames to already be clean from prior iterations.
     # Disabled by default; enable only after validating basic pipeline quality.
@@ -329,19 +335,30 @@ class FIFOPipeline:
             queue.pop(0)
             noise = torch.randn(1, C, H, W, device=device, dtype=dtype)
             if cfg.anchor_init:
-                # Anchor init: start from last clean frame + full noise.
-                # Gives temporal coherence: denoising "remembers" the previous frame.
-                new_frame = last_clean + sigma_max * noise
+                # Partial anchor init: new tail = last_clean + frac * σ_max * noise.
+                # anchor_noise_frac=1.0 → full noise (high creativity, more drift)
+                # anchor_noise_frac=0.75 → 75% noise (balanced coherence / motion)
+                frac = cfg.anchor_noise_frac
+                new_sigma = sigma_max * frac
+                new_frame = last_clean + new_sigma * noise
+                # Find the sigma index corresponding to new_sigma so denoising
+                # starts from the right noise level (not always from sigma_max).
+                if frac < 0.99:
+                    dist = torch.abs(all_sigmas - new_sigma)
+                    new_tail_idx = int(dist.argmin().item())
+                    new_tail_idx = min(new_tail_idx, len(all_sigmas) - 2)
+                else:
+                    new_tail_idx = 0  # sigma_max → start from beginning
             else:
                 # Pure noise: fully independent generation (less coherent)
                 new_frame = noise * sigma_max
+                new_tail_idx = 0
             queue.append(new_frame)
 
-            # Critical: shift the sigma index array to match the new queue layout.
-            # Drop the head's index, reset the new tail's index to 0 (= sigma_max).
+            # Shift the sigma index array: drop head's index, append new tail's index.
             queue_step_indices = torch.cat([
                 queue_step_indices[1:],
-                torch.zeros(1, dtype=torch.long, device=device),
+                torch.tensor([new_tail_idx], dtype=torch.long, device=device),
             ])
 
             elapsed = time.perf_counter() - t_start

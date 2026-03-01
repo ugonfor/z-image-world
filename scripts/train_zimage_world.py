@@ -184,7 +184,14 @@ def train(args):
     # Resume from checkpoint
     start_epoch = 0
     global_step = 0
-    if args.resume and Path(args.resume).exists():
+    if args.warmstart and Path(args.warmstart).exists():
+        # Load trained temporal weights but reset epoch/step to 0 (new dataset run)
+        print(f"Warm-starting temporal weights from {args.warmstart}")
+        ckpt = torch.load(args.warmstart, map_location=device)
+        model.temporal_layers.load_state_dict(ckpt["temporal_state_dict"])
+        prev_epoch = ckpt.get("epoch", "?")
+        print(f"  Loaded weights from epoch {prev_epoch} (counters reset to 0)")
+    elif args.resume and Path(args.resume).exists():
         print(f"Resuming from {args.resume}")
         ckpt = torch.load(args.resume, map_location=device)
         model.temporal_layers.load_state_dict(ckpt["temporal_state_dict"])
@@ -335,6 +342,9 @@ def main():
     parser.add_argument("--save_every", type=int, default=5, help="Save checkpoint every N epochs")
     parser.add_argument("--num_samples", type=int, default=50, help="Number of synthetic samples")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint path")
+    parser.add_argument("--warmstart", type=str, default=None,
+                        help="Load temporal weights from checkpoint but reset epoch/step counters "
+                             "(use when continuing training on a new dataset)")
     parser.add_argument("--download", action="store_true", help="Download video data before training")
     parser.add_argument("--quick", action="store_true", help="Quick test run")
     parser.add_argument("--model_path", type=str, default=None, help="Local model path or HuggingFace model ID")
