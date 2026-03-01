@@ -215,6 +215,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="inference_output/zimage_world", help="Output directory")
     parser.add_argument("--save_gif", action="store_true", help="Save as GIF")
     parser.add_argument("--save_video", action="store_true", help="Save as MP4")
+    parser.add_argument("--model_path", type=str, default=None, help="Local model path (avoids re-download)")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -224,8 +225,9 @@ def main():
     print("\n=== Loading Z-Image World Model ===")
     from models.zimage_world_model import ZImageWorldModel
 
+    model_id = args.model_path if args.model_path else "Tongyi-MAI/Z-Image-Turbo"
     model = ZImageWorldModel.from_pretrained(
-        "Tongyi-MAI/Z-Image-Turbo",
+        model_id,
         torch_dtype=torch.bfloat16,
         temporal_every_n=args.temporal_every_n,
         freeze_spatial=True,

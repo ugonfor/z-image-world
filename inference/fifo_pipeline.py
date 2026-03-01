@@ -69,6 +69,10 @@ class FIFOConfig:
     # Disabled by default; enable only after validating basic pipeline quality.
     use_lookahead: bool = False
     lookahead_fraction: float = 0.167  # fraction of queue frozen (1/K = just the head)
+    # Classifier-Free Guidance: run two forward passes (null + text) and extrapolate.
+    # Improves text adherence and reduces semantic drift at 2x compute cost per step.
+    # use_cfg=False recommended for real-time use; True for highest quality.
+    use_cfg: bool = False
 
 
 class FIFOPipeline:
@@ -217,6 +221,7 @@ class FIFOPipeline:
         # Critical: pass real caption features to the Z-Image transformer so
         # frames are denoised with text guidance, not unconditioned (null caps).
         cap_feats = None
+        null_cap_feats = None
         if hasattr(self, "_zimage_pipe"):
             print(f"Encoding prompt for text conditioning...")
             with torch.no_grad():
@@ -227,6 +232,16 @@ class FIFOPipeline:
                 )
             cap_feats = cap_feats_list[0].to(dtype=dtype)  # (seq_len, cap_feat_dim)
             print(f"  Caption features: {cap_feats.shape}")
+            if cfg.use_cfg:
+                # Null caption: 32 zero-tokens (matches the model's internal null)
+                _SEQ_MULTI_OF = 32
+                _cap_feat_dim = getattr(
+                    self.model.transformer.config, "cap_feat_dim", 2560
+                )
+                null_cap_feats = torch.zeros(
+                    _SEQ_MULTI_OF, _cap_feat_dim, device=device, dtype=dtype
+                )
+                print(f"  CFG enabled (guidance_scale={cfg.guidance_scale})")
 
         # ── 1. Generate seed image with ZImagePipeline ──────────────────────
         if seed_image is None:
@@ -307,9 +322,19 @@ class FIFOPipeline:
 
                 # Forward pass through ZImageWorldModel with text conditioning
                 with torch.inference_mode():
-                    v_pred = self.model(
-                        latent_seq, t_per_frame, cap_feat_override=cap_feats
-                    )  # (1, K, C, H, W)
+                    if cfg.use_cfg and null_cap_feats is not None:
+                        # Classifier-Free Guidance: run null + text, extrapolate
+                        v_null = self.model(
+                            latent_seq, t_per_frame, cap_feat_override=null_cap_feats
+                        )
+                        v_text = self.model(
+                            latent_seq, t_per_frame, cap_feat_override=cap_feats
+                        )
+                        v_pred = v_null + cfg.guidance_scale * (v_text - v_null)
+                    else:
+                        v_pred = self.model(
+                            latent_seq, t_per_frame, cap_feat_override=cap_feats
+                        )  # (1, K, C, H, W)
 
                 # Euler step: update all frames (or only rear portion with lookahead)
                 for qi in range(lookahead_start, cfg.queue_size):
