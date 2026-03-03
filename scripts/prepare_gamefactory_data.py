@@ -139,6 +139,26 @@ def process_clip(
     return True
 
 
+def _find_json(mp4_path: Path, root_dir: Path) -> Path | None:
+    """Find the action JSON for an mp4 file.
+
+    Supports two GameFactory layouts:
+      Layout A (sample-10): mp4 and json are siblings in the same dir
+      Layout B (data_269):  mp4 in root/video/, json in root/metadata/
+    """
+    # Layout A: sibling JSON
+    sibling = mp4_path.with_suffix(".json")
+    if sibling.exists():
+        return sibling
+    # Layout B: metadata/<stem>.json relative to common root
+    metadata_dir = root_dir / "metadata"
+    if metadata_dir.is_dir():
+        candidate = metadata_dir / f"{mp4_path.stem}.json"
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def process_directory(src_dir: Path, output_dir: Path) -> int:
     """Convert all GameFactory clips in a directory. Returns clip count."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -149,10 +169,11 @@ def process_directory(src_dir: Path, output_dir: Path) -> int:
 
     ok = 0
     skipped = 0
+    missing_json = 0
     for mp4_path in mp4_files:
-        json_path = mp4_path.with_suffix(".json")
-        if not json_path.exists():
-            print(f"  SKIP: no JSON for {mp4_path.name}")
+        json_path = _find_json(mp4_path, src_dir)
+        if json_path is None:
+            missing_json += 1
             continue
 
         clip_name = mp4_path.stem  # e.g. seed_1_part_1
@@ -168,6 +189,8 @@ def process_directory(src_dir: Path, output_dir: Path) -> int:
         else:
             print(f"  FAIL: {clip_name}")
 
+    if missing_json:
+        print(f"  Skipped {missing_json} mp4s with no matching JSON")
     return ok + skipped
 
 
