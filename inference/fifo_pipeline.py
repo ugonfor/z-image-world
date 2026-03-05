@@ -73,6 +73,10 @@ class FIFOConfig:
     # Improves text adherence and reduces semantic drift at 2x compute cost per step.
     # use_cfg=False recommended for real-time use; True for highest quality.
     use_cfg: bool = False
+    # Action conditioning: pass per-frame discrete action indices to the model.
+    # Requires a Stage 2 checkpoint (action_encoder + action_injections trained).
+    # Actions: 0=idle, 1=forward, 2=backward, 3=left, 4=right, 5=run, 6=jump, 7=interact
+    use_actions: bool = False
 
 
 class FIFOPipeline:
@@ -143,11 +147,26 @@ class FIFOPipeline:
               f"{model.num_trainable_params() / 1e6:.1f}M trainable")
 
         if checkpoint and Path(checkpoint).exists():
-            print(f"Loading temporal checkpoint: {checkpoint}")
+            print(f"Loading checkpoint: {checkpoint}")
             ckpt = torch.load(checkpoint, map_location=device)
             model.temporal_layers.load_state_dict(ckpt["temporal_state_dict"])
-            print(f"  Loaded epoch {ckpt.get('epoch', '?')}, "
-                  f"gamma[0]={list(ckpt['temporal_state_dict'].values())[0].item():.4f}")
+            gamma0 = list(ckpt["temporal_state_dict"].values())[0].item()
+            has_actions = (
+                "action_injections_state_dict" in ckpt
+                and "action_encoder_state_dict" in ckpt
+            )
+            if has_actions:
+                model.action_injections.load_state_dict(
+                    ckpt["action_injections_state_dict"]
+                )
+                model.action_encoder.load_state_dict(
+                    ckpt["action_encoder_state_dict"]
+                )
+                print(f"  Stage 2 checkpoint (action layers loaded), "
+                      f"epoch={ckpt.get('epoch','?')}, gamma[0]={gamma0:.4f}")
+            else:
+                print(f"  Stage 1 checkpoint, "
+                      f"epoch={ckpt.get('epoch','?')}, gamma[0]={gamma0:.4f}")
 
         model.eval()
 
@@ -196,6 +215,7 @@ class FIFOPipeline:
         num_frames: int = 24,
         seed_image: Optional[Image.Image] = None,
         seed: int = 42,
+        actions: Optional[list[int]] = None,
     ) -> list[Image.Image]:
         """Generate a video sequence using FIFO-Diffusion.
 
@@ -204,6 +224,10 @@ class FIFOPipeline:
             num_frames: Total output frames to generate
             seed_image: Optional starting image (skips seed generation if provided)
             seed: Random seed for reproducibility
+            actions: Optional per-frame action indices (length >= num_frames).
+                     0=idle, 1=forward, 2=backward, 3=left, 4=right,
+                     5=run, 6=jump, 7=interact. Requires Stage 2 checkpoint.
+                     If shorter than num_frames, padded with ACTION_IDLE (0).
 
         Returns:
             List of PIL images (num_frames long)
@@ -320,20 +344,39 @@ class FIFOPipeline:
                 t_per_frame = (all_sigmas[queue_step_indices] * 1000.0).float()
                 t_per_frame = t_per_frame.unsqueeze(0)  # (1, K)
 
+                # Build per-frame action tensor for this queue window
+                actions_tensor = None
+                if actions is not None and cfg.use_actions:
+                    # Queue holds frames [frame_out_idx, ..., frame_out_idx + K - 1]
+                    K = cfg.queue_size
+                    action_indices = [
+                        actions[min(frame_out_idx + qi, len(actions) - 1)]
+                        for qi in range(K)
+                    ]
+                    actions_tensor = torch.tensor(
+                        [action_indices], dtype=torch.long, device=device
+                    )  # (1, K)
+
                 # Forward pass through ZImageWorldModel with text conditioning
                 with torch.inference_mode():
                     if cfg.use_cfg and null_cap_feats is not None:
                         # Classifier-Free Guidance: run null + text, extrapolate
                         v_null = self.model(
-                            latent_seq, t_per_frame, cap_feat_override=null_cap_feats
+                            latent_seq, t_per_frame,
+                            actions=actions_tensor,
+                            cap_feat_override=null_cap_feats,
                         )
                         v_text = self.model(
-                            latent_seq, t_per_frame, cap_feat_override=cap_feats
+                            latent_seq, t_per_frame,
+                            actions=actions_tensor,
+                            cap_feat_override=cap_feats,
                         )
                         v_pred = v_null + cfg.guidance_scale * (v_text - v_null)
                     else:
                         v_pred = self.model(
-                            latent_seq, t_per_frame, cap_feat_override=cap_feats
+                            latent_seq, t_per_frame,
+                            actions=actions_tensor,
+                            cap_feat_override=cap_feats,
                         )  # (1, K, C, H, W)
 
                 # Euler step: update all frames (or only rear portion with lookahead)
