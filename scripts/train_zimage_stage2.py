@@ -54,6 +54,7 @@ from einops import rearrange
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from training.diffusion_forcing import DiffusionForcingConfig, DiffusionForcingLoss
+from training.action_finetune import ActionConditioningLoss
 
 
 class ActionVideoDataset(Dataset):
@@ -199,8 +200,7 @@ def train_stage2(args):
     for p in model.action_encoder.parameters():
         p.requires_grad_(True)
 
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    total_params = sum(p.numel() for p in trainable)
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable params: {total_params / 1e6:.1f}M")
 
     model.enable_gradient_checkpointing()
@@ -221,13 +221,23 @@ def train_stage2(args):
     )
     print(f"Dataset: {len(dataset)} clips, batch_size={args.batch_size}")
 
-    # --- Optimizer ---
-    optimizer = torch.optim.AdamW(
-        trainable,
-        lr=args.lr,
-        weight_decay=0.01,
-        betas=(0.9, 0.999),
+    # --- Optimizer (parameter groups for independent LRs) ---
+    action_params = (
+        list(model.action_injections.parameters())
+        + list(model.action_encoder.parameters())
     )
+    temporal_params = list(model.temporal_layers.parameters())
+    lr_temporal = args.lr_temporal
+    if args.unfreeze_temporal:
+        param_groups = [
+            {"params": action_params, "lr": args.lr},
+            {"params": temporal_params, "lr": lr_temporal},
+        ]
+        print(f"Optimizer: action lr={args.lr:.1e}, temporal lr={lr_temporal:.1e}")
+    else:
+        param_groups = [{"params": action_params, "lr": args.lr}]
+        print(f"Optimizer: action lr={args.lr:.1e}")
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01, betas=(0.9, 0.999))
     total_steps = args.epochs * len(dataset) // (args.batch_size * args.grad_accum)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(total_steps, 1), eta_min=args.lr * 0.01,
@@ -243,6 +253,13 @@ def train_stage2(args):
         num_frames=args.num_frames,
     )
     loss_fn = DiffusionForcingLoss(df_config).to(device)
+    contrastive_weight = args.contrastive_weight
+    action_loss_fn = ActionConditioningLoss() if contrastive_weight > 0 else None
+    if action_loss_fn:
+        print(f"Contrastive action loss enabled (weight={contrastive_weight})")
+
+    # Collect all trainable parameters for gradient clipping
+    all_trainable = [p for p in model.parameters() if p.requires_grad]
 
     # --- Checkpoint directory ---
     ckpt_dir = Path(args.checkpoint_dir)
@@ -290,13 +307,22 @@ def train_stage2(args):
                     model_output = model_output.unsqueeze(1)
                 loss_dict = loss_fn(model_output, latents, noise, timesteps)
 
+                # Contrastive action loss: forces different actions → different embeddings
+                if action_loss_fn is not None and batch_size >= 2:
+                    action_emb = model.action_encoder(actions)  # (B, F, D)
+                    c_loss = action_loss_fn._action_consistency_loss(
+                        model_output, actions, action_emb
+                    )
+                    loss_dict["loss"] = loss_dict["loss"] + contrastive_weight * c_loss
+                    loss_dict["action_loss"] = c_loss
+
             loss = loss_dict["loss"] / args.grad_accum
             loss.backward()
             epoch_loss += loss_dict["loss"].item()
             epoch_steps += 1
 
             if (batch_idx + 1) % args.grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(all_trainable, max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
                 scheduler.step()
@@ -304,7 +330,7 @@ def train_stage2(args):
 
         # Flush remaining
         if epoch_steps % args.grad_accum != 0:
-            torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(all_trainable, max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
             scheduler.step()
@@ -358,6 +384,10 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--lr_temporal", type=float, default=None,
+                        help="LR for temporal layers when --unfreeze_temporal (defaults to --lr)")
+    parser.add_argument("--contrastive_weight", type=float, default=0.0,
+                        help="Weight for action contrastive loss (requires batch_size>=2)")
     parser.add_argument("--grad_accum", type=int, default=4)
     parser.add_argument("--temporal_every_n", type=int, default=3)
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/zimage_stage2")
@@ -366,6 +396,8 @@ def main():
     parser.add_argument("--unfreeze_temporal", action="store_true",
                         help="Unfreeze temporal layers for joint training")
     args = parser.parse_args()
+    if args.lr_temporal is None:
+        args.lr_temporal = args.lr
     train_stage2(args)
 
 

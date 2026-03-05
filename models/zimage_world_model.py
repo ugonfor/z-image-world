@@ -271,7 +271,10 @@ class ZImageActionInjectionLayer(nn.Module):
     def _init_weights(self):
         for module in [self.to_q, self.to_k, self.to_v]:
             nn.init.xavier_uniform_(module.weight, gain=0.1)
-        nn.init.zeros_(self.to_out[0].weight)
+        # NOTE: to_out must NOT be zero-initialized. With to_out=0 and gate=0,
+        # d_loss/d_gate = sigmoid'(gate) * to_out(attn) = 0 → gate stuck.
+        # Small but non-zero weight lets gradient flow to gate from step 1.
+        nn.init.xavier_uniform_(self.to_out[0].weight, gain=0.01)
         nn.init.zeros_(self.to_out[0].bias)
 
     def forward(
