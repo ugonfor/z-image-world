@@ -193,6 +193,16 @@ def train_stage2(args):
         print("Temporal layers unfrozen (joint training)")
         for p in model.temporal_layers.parameters():
             p.requires_grad_(True)
+        # Cast scalar gamma params to float32 to avoid bfloat16 precision floor.
+        # In bfloat16, gamma≈0.025 has step size ~1.2e-4; lr=5e-6 updates ~5e-6 → never updates.
+        # float32 precision at 0.025 is ~6e-9, always below any gradient update.
+        n_cast = 0
+        for name, p in model.temporal_layers.named_parameters():
+            if "gamma" in name and p.dtype == torch.bfloat16:
+                p.data = p.data.float()
+                n_cast += 1
+        if n_cast:
+            print(f"  Cast {n_cast} gamma params to float32 (bfloat16 precision fix)")
 
     # Unfreeze action layers
     for p in model.action_injections.parameters():

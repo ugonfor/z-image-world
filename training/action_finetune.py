@@ -154,12 +154,16 @@ class ActionConditioningLoss(nn.Module):
         # Pairwise cosine similarity
         sim = emb_norm @ emb_norm.T  # (B, B)
 
-        # Action match matrix
+        # Action match matrix: same action → target 1.0, different → target -1.0
+        # Using {-1, 1} instead of {0, 1} ensures different-action pairs have
+        # active gradients from initialization (sim≈0, target=-1 → push apart),
+        # not just same-action pairs (which are rare with small batches).
         actions_first = actions[:, 0]
-        match = (actions_first.unsqueeze(1) == actions_first.unsqueeze(0)).float()
+        match = 2.0 * (actions_first.unsqueeze(1) == actions_first.unsqueeze(0)).float() - 1.0
 
-        # Same actions should have similar embeddings, different actions different
-        loss = F.mse_loss(sim, match)
+        # Exclude diagonal (self-similarity is trivially 1)
+        mask = ~torch.eye(batch_size, dtype=torch.bool, device=sim.device)
+        loss = F.mse_loss(sim[mask], match[mask])
         return loss
 
 
