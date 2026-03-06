@@ -281,15 +281,19 @@ class ZImageActionInjectionLayer(nn.Module):
         self,
         x: torch.Tensor,
         action_conditioning: torch.Tensor,
-    ) -> torch.Tensor:
+        return_residual: bool = False,
+    ):
         """Apply action conditioning via cross-attention.
 
         Args:
             x: Hidden states (batch, seq_len, hidden_dim)
             action_conditioning: Action embeddings (batch, num_actions, hidden_dim)
+            return_residual: If True, also return the injection residual
+                (sigmoid(gate) * to_out(cross_attn)) for contrastive loss.
 
         Returns:
-            Conditioned hidden states
+            Conditioned hidden states, or (conditioned_hidden, residual) if
+            return_residual=True. residual has shape (batch, seq_len, hidden_dim).
         """
         x_norm = self.norm_x(x)
         cond_norm = self.norm_cond(action_conditioning)
@@ -302,7 +306,10 @@ class ZImageActionInjectionLayer(nn.Module):
         out = rearrange(out, "b h n d -> b n (h d)")
         out = self.to_out(out)
 
-        return x + torch.sigmoid(self.gate) * out
+        residual = torch.sigmoid(self.gate) * out
+        if return_residual:
+            return x + residual, residual
+        return x + residual
 
 
 class ZImageActionEncoder(nn.Module):
@@ -572,7 +579,8 @@ class ZImageWorldModel(nn.Module):
         timesteps: torch.Tensor,
         actions: Optional[torch.Tensor] = None,
         cap_feat_override: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_injection_residuals: bool = False,
+    ):
         """Forward pass for diffusion denoising.
 
         This hooks into the Z-Image transformer's forward pass, intercepting
@@ -586,9 +594,13 @@ class ZImageWorldModel(nn.Module):
             cap_feat_override: Pre-computed caption features (seq_len, cap_feat_dim).
                 If provided, these are used for text conditioning instead of null captions.
                 Compute once via ZImagePipeline.encode_prompt() and reuse across steps.
+            return_injection_residuals: If True, also return list of injection residuals
+                (one per injection layer) for injection contrastive loss computation.
+                Each residual has shape (batch, num_frames, hidden_dim).
 
         Returns:
-            Predicted noise (same shape as latents)
+            Predicted noise (same shape as latents), or (noise_pred, injection_residuals)
+            if return_injection_residuals=True.
         """
         # Handle single frame
         if latents.dim() == 4:
@@ -610,7 +622,7 @@ class ZImageWorldModel(nn.Module):
             timesteps_flat = rearrange(timesteps, "b f -> (b f)")
 
         # Run through Z-Image transformer with temporal injection
-        noise_pred = self._forward_with_temporal(
+        fwd_result = self._forward_with_temporal(
             latents_flat,
             timesteps_flat,
             batch_size=batch_size,
@@ -619,14 +631,23 @@ class ZImageWorldModel(nn.Module):
             height=height,
             width=width,
             cap_feat_override=cap_feat_override,
+            return_injection_residuals=return_injection_residuals,
         )
 
+        if return_injection_residuals:
+            noise_pred_flat, injection_residuals = fwd_result
+        else:
+            noise_pred_flat = fwd_result
+            injection_residuals = None
+
         # Reshape back
-        noise_pred = rearrange(noise_pred, "(b f) c h w -> b f c h w", b=batch_size, f=num_frames)
+        noise_pred = rearrange(noise_pred_flat, "(b f) c h w -> b f c h w", b=batch_size, f=num_frames)
 
         if num_frames == 1:
             noise_pred = noise_pred.squeeze(1)
 
+        if return_injection_residuals:
+            return noise_pred, injection_residuals
         return noise_pred
 
     def _forward_with_temporal(
@@ -639,7 +660,8 @@ class ZImageWorldModel(nn.Module):
         height: int,
         width: int,
         cap_feat_override: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_injection_residuals: bool = False,
+    ):
         """Run Z-Image transformer with temporal attention injected after each block.
 
         Replicates the Z-Image transformer's forward flow but adds temporal
@@ -770,6 +792,7 @@ class ZImageWorldModel(nn.Module):
         img_len = x_item_seqlens[0]
 
         # --- Main transformer blocks with temporal + action injection ---
+        injection_residuals = [] if return_injection_residuals else None
         for i, layer in enumerate(transformer.layers):
             # Z-Image spatial block
             unified = layer(unified, unified_attn_mask, unified_freqs, adaln_input)
@@ -797,7 +820,16 @@ class ZImageWorldModel(nn.Module):
                 # frame's image tokens cross-attend to only its own action.
                 # This prevents future action leakage.
                 action_per_frame = rearrange(action_cond, "b f d -> (b f) 1 d")
-                img_tokens = action_layer(img_tokens, action_per_frame)
+                if return_injection_residuals:
+                    img_tokens, residual = action_layer(
+                        img_tokens, action_per_frame, return_residual=True
+                    )
+                    # residual: (B*F, seq_len, D) → pool to (B*F, D) then split to (B, F, D)
+                    residual_pooled = residual.mean(dim=1)  # (B*F, D)
+                    residual_pooled = rearrange(residual_pooled, "(b f) d -> b f d", b=batch_size)
+                    injection_residuals.append(residual_pooled)
+                else:
+                    img_tokens = action_layer(img_tokens, action_per_frame)
                 unified = torch.cat([img_tokens.to(unified.dtype), unified[:, img_len:]], dim=1)
 
         # --- Final layer ---
@@ -814,6 +846,8 @@ class ZImageWorldModel(nn.Module):
         output = torch.stack(output, dim=0)  # (B*F, C, 1, H, W)
         output = output.squeeze(2)  # (B*F, C, H, W)
 
+        if return_injection_residuals:
+            return output, injection_residuals
         return output
 
     # ------------------------------------------------------------------

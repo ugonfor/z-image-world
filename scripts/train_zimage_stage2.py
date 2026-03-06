@@ -267,6 +267,9 @@ def train_stage2(args):
     action_loss_fn = ActionConditioningLoss() if contrastive_weight > 0 else None
     if action_loss_fn:
         print(f"Contrastive action loss enabled (weight={contrastive_weight})")
+    injection_contrastive_weight = args.injection_contrastive_weight
+    if injection_contrastive_weight > 0:
+        print(f"Injection residual contrastive loss enabled (weight={injection_contrastive_weight})")
 
     # Collect all trainable parameters for gradient clipping
     all_trainable = [p for p in model.parameters() if p.requires_grad]
@@ -312,7 +315,14 @@ def train_stage2(args):
             noisy_latents = loss_fn.add_noise(latents, noise, timesteps)
 
             with torch.amp.autocast(device, dtype=torch.bfloat16, enabled=(device == "cuda")):
-                model_output = model(noisy_latents, timesteps.float(), actions=actions)
+                fwd = model(
+                    noisy_latents, timesteps.float(), actions=actions,
+                    return_injection_residuals=(injection_contrastive_weight > 0 and batch_size >= 2),
+                )
+                if isinstance(fwd, tuple):
+                    model_output, inj_residuals = fwd
+                else:
+                    model_output, inj_residuals = fwd, None
                 if model_output.dim() == 4 and latents.dim() == 5:
                     model_output = model_output.unsqueeze(1)
                 loss_dict = loss_fn(model_output, latents, noise, timesteps)
@@ -325,6 +335,23 @@ def train_stage2(args):
                     )
                     loss_dict["loss"] = loss_dict["loss"] + contrastive_weight * c_loss
                     loss_dict["action_loss"] = c_loss
+
+                # Injection residual contrastive loss: forces to_out(cross_attn) to differ
+                # across actions. Trains injection gates/to_out directly via diffusion path.
+                if inj_residuals is not None and batch_size >= 2:
+                    import torch.nn.functional as F_fn
+                    actions_first = actions[:, 0]
+                    match = 2.0 * (actions_first.unsqueeze(1) == actions_first.unsqueeze(0)).float() - 1.0
+                    mask_diag = ~torch.eye(batch_size, dtype=torch.bool, device=device)
+                    inj_loss = torch.tensor(0.0, device=device)
+                    for residual in inj_residuals:  # each (B, F, D)
+                        r_first = residual[:, 0].float()  # (B, D) — first frame
+                        r_norm = F_fn.normalize(r_first, dim=-1)
+                        sim = r_norm @ r_norm.T  # (B, B)
+                        inj_loss = inj_loss + F_fn.mse_loss(sim[mask_diag], match[mask_diag])
+                    inj_loss = inj_loss / max(len(inj_residuals), 1)
+                    loss_dict["loss"] = loss_dict["loss"] + injection_contrastive_weight * inj_loss
+                    loss_dict["injection_loss"] = inj_loss
 
             loss = loss_dict["loss"] / args.grad_accum
             loss.backward()
@@ -405,6 +432,10 @@ def main():
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--unfreeze_temporal", action="store_true",
                         help="Unfreeze temporal layers for joint training")
+    parser.add_argument("--injection_contrastive_weight", type=float, default=0.0,
+                        help="Weight for injection residual contrastive loss. "
+                             "Directly trains to_out weights by forcing injection outputs "
+                             "to differ across actions. Use 0.5-2.0 for Stage 3d.")
     args = parser.parse_args()
     if args.lr_temporal is None:
         args.lr_temporal = args.lr

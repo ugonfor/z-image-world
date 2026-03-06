@@ -1,12 +1,15 @@
 #!/bin/bash
-# Stage 3d: Higher contrastive signal to break to_out stagnation
+# Stage 3d: Injection residual contrastive loss to break to_out stagnation
 #
-# Stage 3b/3c: to_out stagnates at max≈0.007 because diffusion loss equilibrium
-# prevents action injection from growing. Fix: increase contrastive_weight to make
-# action discrimination more important, forcing to_out past the equilibrium.
+# Stage 3b/3c: to_out stagnates at max≈0.007 because contrastive loss trains
+# only the action encoder, not the injection layer's to_out/gate weights.
+# Diffusion loss alone cannot push to_out past its equilibrium.
+#
+# Fix: injection_contrastive_weight=1.0 directly forces to_out(cross_attn) to
+# produce different outputs for different actions — trains to_out directly.
 #
 # Changes vs Stage 3c:
-#   contrastive_weight: 0.3 → 1.0 (3× increase)
+#   injection_contrastive_weight: 0.0 → 1.0 (new: trains to_out directly)
 #   Resumes from Stage 3c final checkpoint
 
 set -e
@@ -52,7 +55,8 @@ PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python python scripts/train_zimage_stage2
     --grad_accum 2 \
     --lr 5e-5 \
     --lr_temporal 1e-4 \
-    --contrastive_weight 1.0 \
+    --contrastive_weight 0.3 \
+    --injection_contrastive_weight 1.0 \
     --unfreeze_temporal \
     --save_every 10 \
     2>&1 | tee logs/train_stage3d.log
