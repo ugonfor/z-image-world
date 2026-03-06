@@ -160,6 +160,44 @@ def analyze_checkpoint(ckpt_path: str, baseline_path: str = None):
     else:
         fwd_bwd_proj = None
 
+    # --- 4b. Injection residual similarity ---
+    inj_fwd_bwd = None
+    try:
+        from models.zimage_world_model import ZImageActionInjectionLayer, ZImageActionEncoder
+        import torch.nn.functional as F_fn
+
+        enc = ZImageActionEncoder(num_actions=17, embedding_dim=512)
+        enc.load_state_dict(ae)
+        enc.eval()
+
+        # Use first injection layer (key "7")
+        inj_state = {k[2:]: v for k, v in ai.items() if k.startswith("7.")}
+        inj = ZImageActionInjectionLayer(hidden_dim=3840, num_heads=30)
+        try:
+            inj.load_state_dict(inj_state)
+        except Exception:
+            inj = None
+
+        if inj is not None:
+            inj.eval()
+            actions_pair = torch.tensor([[1, 1], [2, 2]])  # fwd, bwd — 2 frames each
+            with torch.no_grad():
+                emb = enc(actions_pair)  # (2, 2, 3840)
+                # Use a fixed mock x (zeros → isolates action-driven component)
+                x_mock = torch.zeros(2, 32, 3840)  # (B, seq=32, D)
+                cond = emb[:, 0:1, :]  # (B, 1, D) first frame
+                _, residual = inj(x_mock, cond, return_residual=True)  # (B, 32, D)
+            r = residual.mean(dim=1).float()  # (B, D)
+            r_norm = F_fn.normalize(r, dim=-1)
+            sim_inj = (r_norm[0] * r_norm[1]).sum().item()
+            inj_fwd_bwd = sim_inj
+            print(f"\n--- Injection Residual Similarity (layer 7) ---")
+            print(f"  cos_sim(fwd_inj, bwd_inj): {sim_inj:.4f}")
+            print(f"  Ideal: -1.0 (fully opposite), Bad: +1.0 (identical action signals)")
+            print(f"  to_out max: {ai['7.to_out.0.weight'].float().abs().max():.6f}")
+    except Exception as e:
+        pass
+
     # --- 5. Summary verdict ---
     fwd_bwd_sim = sim[1, 2].item()
     gate_mean = np.mean([torch.sigmoid(ai[k].float()).item() for k in gate_keys])
@@ -184,6 +222,7 @@ def analyze_checkpoint(ckpt_path: str, baseline_path: str = None):
     else:
         verdict = "NOT YET — embeddings still at noise level"
     print(f"  projected fwd/bwd: {fwd_bwd_proj:.4f}" if fwd_bwd_proj is not None else "  projected: N/A")
+    print(f"  injection residual fwd/bwd: {inj_fwd_bwd:.4f}" if inj_fwd_bwd is not None else "  injection: N/A")
     print(f"  verdict: {verdict}")
     print(f"{'='*60}\n")
 
