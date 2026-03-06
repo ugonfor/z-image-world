@@ -153,6 +153,48 @@ class TestCausalDiT:
         assert cache2 is not None
 
 
+class TestZImageActionInjectionLayer:
+    """Tests for ZImageActionInjectionLayer injection residual path."""
+
+    @pytest.fixture
+    def injection_layer(self):
+        from models.zimage_world_model import ZImageActionInjectionLayer
+        return ZImageActionInjectionLayer(hidden_dim=128, num_heads=4)
+
+    def test_injection_forward_default(self, injection_layer):
+        """Default forward (no residual) returns conditioned hidden states."""
+        x = torch.randn(2, 16, 128)
+        cond = torch.randn(2, 1, 128)
+        out = injection_layer(x, cond)
+        assert out.shape == x.shape
+
+    def test_injection_forward_with_residual(self, injection_layer):
+        """return_residual=True returns (output, residual) with correct shapes."""
+        x = torch.randn(2, 16, 128)
+        cond = torch.randn(2, 1, 128)
+        out, residual = injection_layer(x, cond, return_residual=True)
+        assert out.shape == x.shape
+        assert residual.shape == x.shape
+
+    def test_injection_residual_is_gate_scaled(self, injection_layer):
+        """Residual = sigmoid(gate) * to_out(cross_attn), output = x + residual."""
+        x = torch.randn(2, 16, 128)
+        cond = torch.randn(2, 1, 128)
+        out, residual = injection_layer(x, cond, return_residual=True)
+        # out = x + residual
+        assert torch.allclose(out - x, residual, atol=1e-5)
+
+    def test_injection_residual_differs_by_action(self, injection_layer):
+        """Different action conditionings produce different residuals."""
+        x = torch.randn(1, 16, 128)
+        cond1 = torch.randn(1, 1, 128)
+        cond2 = torch.randn(1, 1, 128)
+        _, residual1 = injection_layer(x, cond1, return_residual=True)
+        _, residual2 = injection_layer(x, cond2, return_residual=True)
+        # Different conditioning must produce different residuals
+        assert not torch.allclose(residual1, residual2, atol=1e-6)
+
+
 class TestCausalMask:
     """Tests for causal masking."""
 
